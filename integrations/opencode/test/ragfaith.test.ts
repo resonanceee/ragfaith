@@ -159,8 +159,9 @@ describe("judge selection", () => {
     } as Record<string, string>);
     expect(isActiveJudgeModel("local/glm-5.3-flash", c)).toBe(true);
     expect(isActiveJudgeModel("local/glm-5.3-flash:free", c)).toBe(true);
+    expect(isActiveJudgeModel("local/glm-4.6-flash", c)).toBe(false);
     expect(selectJudgeModel("local/glm-5.3-flash", c)).toBe("local/ds");
-    expect(selectJudgeModel("local/glm-5-flash", c)).toBe("local/glm-5.3-flash");
+    expect(selectJudgeModel("local/glm-4.6-flash", c)).toBe("local/glm-5.3-flash");
   });
 });
 
