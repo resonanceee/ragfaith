@@ -21,11 +21,13 @@ import hashlib
 import http.client
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +48,9 @@ SSE_DONE = object()
 
 # ponytail: per-conversation store bounded so long sessions can't grow memory without limit
 CONV_MESSAGE_CAP = 128
+CONV_STORE_MAX = 1000
+JUDGE_STORE_MAX = 100
+MAX_BODY = int(os.environ.get("RFE_MAX_BODY", str(10 * 1024 * 1024)))
 
 
 @dataclass
@@ -66,8 +71,6 @@ class Config:
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
-        import os
-
         env = os.environ if env is None else env
         provider = env.get("RFE_JUDGE_PROVIDER", "synthetic")
         if provider == "openrouter":
@@ -108,21 +111,46 @@ def select_judge(active_model: str, cfg: Config) -> str:
     return cfg.glm_model
 
 
+def _content_text(content) -> str:
+    """Flatten message content (str, or text/tool_result blocks) to text; skip
+    non-string values defensively."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        inner = block.get("content")
+        if isinstance(inner, (str, list)):
+            out.append(_content_text(inner))
+        elif isinstance(block.get("text"), str):
+            out.append(block["text"])
+    return " ".join(x for x in out if x)
+
+
 def harvest_premises(messages: list[dict], cap: int) -> str:
     """Concatenate pulled content (tool messages + tool_result blocks), keep the
     most recent `cap` chars."""
     parts = []
     for m in messages:
         content = m.get("content")
-        if m.get("role") == "tool" and isinstance(content, str):
-            parts.append(content)
+        if m.get("role") == "tool":
+            text = _content_text(content)
         elif isinstance(content, list):
-            parts += [
-                b["content"]
+            text = " ".join(
+                _content_text(b)
                 for b in content
                 if isinstance(b, dict) and b.get("type") == "tool_result"
-            ]
-    return "\n\n".join(p for p in parts if p)[-cap:]
+            )
+        else:
+            continue
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)[-cap:]
 
 
 def apply_tool_deltas(acc: list[dict], deltas: list[dict]) -> list[dict]:
@@ -226,11 +254,30 @@ class Cascade:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._lock = threading.Lock()
-        self._judges: dict[str, Judge] = {}
-        self._conv: dict[str, dict] = {}
+        self._judges: OrderedDict[str, Judge] = OrderedDict()
+        self._conv: OrderedDict[str, dict] = OrderedDict()
         self._end_count = 0
         self.events: list[dict] = []
         self._log_fh = open(cfg.judge_log, "a", encoding="utf-8") if cfg.judge_log else None
+
+    def _state(self, conv: str) -> dict:
+        """Get/create per-conversation state, evicting the LRU entry past the
+        cap. Caller holds self._lock."""
+        st = self._conv.get(conv)
+        if st is None:
+            st = {"messages": [], "nudge": None}
+            self._conv[conv] = st
+            if len(self._conv) > CONV_STORE_MAX:
+                self._conv.popitem(last=False)
+        else:
+            self._conv.move_to_end(conv)
+        return st
+
+    def close(self) -> None:
+        with self._lock:
+            if self._log_fh:
+                self._log_fh.close()
+                self._log_fh = None
 
     def log(self, record: dict) -> None:
         line = json.dumps({"ts": round(time.time(), 3), **record}, ensure_ascii=False)
@@ -255,42 +302,58 @@ class Cascade:
         cid = headers.get("x-conversation-id")
         if cid:
             return cid
+        for m in messages:  # first user message: stable across turns, unique per chat
+            if isinstance(m, dict) and m.get("role") == "user":
+                seed = json.dumps(m, sort_keys=True, ensure_ascii=False)
+                return hashlib.sha256(seed.encode()).hexdigest()[:16]
         if messages:
-            prefix = json.dumps(messages[:1], sort_keys=True, ensure_ascii=False)
-            return hashlib.sha256(prefix.encode()).hexdigest()[:16]
+            seed = json.dumps(messages, sort_keys=True, ensure_ascii=False)
+            return hashlib.sha256(seed.encode()).hexdigest()[:16]
         return headers.get("host", "anon")
 
     def record_messages(self, conv: str, messages: list[dict]) -> None:
         with self._lock:
-            st = self._conv.setdefault(conv, {"messages": [], "nudge": None})
-            if len(messages) >= len(st["messages"]):  # keep the longest known history
-                st["messages"] = list(messages)[-CONV_MESSAGE_CAP:]
+            st = self._state(conv)
+            stored = st["messages"]
+            if len(messages) >= len(stored) and messages[: len(stored)] == stored:
+                merged = list(messages)  # incoming extends the known history
+            else:
+                overlap = 0  # incremental client: splice onto the stored tail
+                for k in range(min(len(stored), len(messages)), 0, -1):
+                    if stored[-k:] == messages[:k]:
+                        overlap = k
+                        break
+                merged = stored + list(messages)[overlap:]
+            st["messages"] = merged[-CONV_MESSAGE_CAP:]
 
     def record_reply(self, conv: str, message: dict) -> None:
         with self._lock:
-            st = self._conv.setdefault(conv, {"messages": [], "nudge": None})
+            st = self._state(conv)
             st["messages"] = (st["messages"] + [dict(message)])[-CONV_MESSAGE_CAP:]
 
     def premises(self, conv: str) -> str:
         with self._lock:
-            messages = list(self._conv.get(conv, {}).get("messages", []))
+            st = self._conv.get(conv)
+            if st is not None:
+                self._conv.move_to_end(conv)
+            messages = list(st["messages"]) if st is not None else []
         return harvest_premises(messages, self.cfg.premise_cap)
 
     def set_nudge(self, conv: str, nudge: str) -> None:
         with self._lock:
-            self._conv.setdefault(conv, {"messages": [], "nudge": None})["nudge"] = nudge
+            self._state(conv)["nudge"] = nudge
 
     def pop_nudge(self, conv: str) -> str | None:
         with self._lock:
-            st = self._conv.setdefault(conv, {"messages": [], "nudge": None})
+            st = self._state(conv)
             nudge = st["nudge"]
             st["nudge"] = None
         return nudge
 
     def judge(self, model: str, token: str) -> Judge:
-        # judges are keyed by (model, client token): verdicts are the same for
-        # any caller, but each caller's judge authenticates with its own key
-        cache_key = f"{model}\x00{token}"
+        # judges are keyed by (model, client token digest): verdicts are the same
+        # for any caller, but each caller's judge authenticates with its own key
+        cache_key = f"{model}\x00{hashlib.sha256(token.encode()).hexdigest()}"
         with self._lock:
             j = self._judges.get(cache_key)
             if j is None:
@@ -306,6 +369,10 @@ class Cascade:
                     log=self.log,
                 )
                 self._judges[cache_key] = j
+                if len(self._judges) > JUDGE_STORE_MAX:
+                    self._judges.popitem(last=False)
+            else:
+                self._judges.move_to_end(cache_key)
         return j
 
     def evaluate(
@@ -347,9 +414,14 @@ def make_handler(cascade: Cascade):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "ragfaith-proxy"
+        timeout = 60  # a stalled client cannot pin a handler thread forever
 
         def log_message(self, fmt, *args):
             logger.debug(fmt, *args)
+
+        def end_headers(self):
+            self._response_started = True
+            super().end_headers()
 
         def do_GET(self):
             if _norm(self.path) != "/v1/models":
@@ -375,6 +447,7 @@ def make_handler(cascade: Cascade):
                 pass
 
         def do_POST(self):
+            self._response_started = False
             if _norm(self.path) != "/v1/chat/completions":
                 self.send_error(404)
                 return
@@ -383,11 +456,32 @@ def make_handler(cascade: Cascade):
             except Exception:  # noqa: BLE001 - proxy must answer, never wedge
                 logger.exception("handler error")
                 cascade.log({"kind": "handler-error"})
+                if not self._response_started:
+                    try:
+                        self.send_error(500, "internal proxy error")
+                    except OSError:
+                        pass
+                self.close_connection = True
 
         # -- chat completions -------------------------------------------------
 
         def _handle_chat(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            length_raw = self.headers.get("Content-Length", "0") or "0"
+            try:
+                length = int(length_raw)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length < 0:
+                self.close_connection = True
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length > MAX_BODY:
+                self.close_connection = True
+                self.send_error(413, "request body too large")
+                return
+            body = self.rfile.read(length)
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError:
@@ -396,7 +490,14 @@ def make_handler(cascade: Cascade):
             if not isinstance(payload, dict):
                 self.send_error(400, "invalid JSON body")
                 return
-            messages = payload.get("messages") or []
+            messages = payload.get("messages")
+            if not isinstance(messages, list):
+                self.send_error(400, "messages must be a list")
+                return
+            model = payload.get("model")
+            if not isinstance(model, str):
+                self.send_error(400, "model must be a string")
+                return
             auth = self.headers.get("Authorization", "")
             if not auth:
                 # client-auth-only: proxy cannot reach upstream or judge without it
@@ -412,17 +513,21 @@ def make_handler(cascade: Cascade):
             if pending is not None:
                 payload["messages"] = messages = inject_nudge(messages, pending)
 
-            judge_model = select_judge(payload.get("model", ""), cfg)
+            judge_model = select_judge(model, cfg)
             upstream_body = json.dumps(payload).encode()
             try:
                 resp, conn = upstream_request(
                     cfg, "POST", "/chat/completions", upstream_body, auth=auth
                 )
             except OSError as e:
+                if pending is not None:  # never lose a stashed nudge on upstream failure
+                    cascade.set_nudge(conv, pending)
                 cascade.log({"kind": "upstream-error", "error": str(e)})
                 self.send_error(502, "upstream connect failed")
                 return
             if resp.status != 200:
+                if pending is not None:
+                    cascade.set_nudge(conv, pending)
                 raw = resp.read()
                 conn.close()
                 self.send_response(resp.status)
@@ -456,7 +561,7 @@ def make_handler(cascade: Cascade):
             try:  # cascade runs after the passthrough; failures only log
                 data = json.loads(raw)
                 choice = (data.get("choices") or [{}])[0]
-                message = choice.get("message") or choice.get("message") or {}
+                message = choice.get("message") or {}
                 text = message.get("content") or ""
                 finish = choice.get("finish_reason")
                 if text and finish == "stop":
@@ -546,8 +651,14 @@ def make_handler(cascade: Cascade):
                         nudge = render_template(template, **_nudge_args(judge_model, flagged))
                         if mode == "chain":
                             try:
-                                self._chain(conv, payload, messages, assistant_text, nudge, auth)
-                                reason = "chained"
+                                chained_ok = self._chain(
+                                    conv, payload, messages, assistant_text, nudge, auth
+                                )
+                                if chained_ok:
+                                    reason = "chained"
+                                else:  # chain failed: keep the nudge for next-mode delivery
+                                    cascade.set_nudge(conv, nudge)
+                                    reason = "stashed"
                             except OSError:
                                 dead = True
                                 reason = "disconnected"
@@ -569,7 +680,8 @@ def make_handler(cascade: Cascade):
 
         def _chain(self, conv, payload, messages, assistant_text, nudge, auth):
             """One internal continuation call with the aggregated nudge, streamed
-            onto the same SSE stream (its own [DONE] swallowed)."""
+            onto the same SSE stream (its own [DONE] swallowed). Returns False on
+            upstream failure so the caller can re-stash the nudge."""
             chained = dict(
                 payload,
                 messages=[
@@ -580,12 +692,20 @@ def make_handler(cascade: Cascade):
                 stream=True,
             )
             chained_body = json.dumps(chained).encode()
-            resp, conn = upstream_request(cfg, "POST", "/chat/completions", chained_body, auth=auth)
+            try:
+                resp, conn = upstream_request(
+                    cfg, "POST", "/chat/completions", chained_body, auth=auth
+                )
+            except OSError:
+                cascade.log(
+                    {"kind": "chain-error", "error": "connect-failed", "conversation": conv}
+                )
+                return False
             if resp.status != 200:
                 cascade.log({"kind": "chain-error", "status": resp.status, "conversation": conv})
                 resp.read()
                 conn.close()
-                return
+                return False
             buf = b""
             try:
                 while True:
@@ -604,6 +724,7 @@ def make_handler(cascade: Cascade):
                     self.wfile.flush()
             finally:
                 conn.close()
+            return True
 
     return Handler
 
@@ -635,7 +756,7 @@ def main():
         cfg.proxy_host = args.host
     if args.port:
         cfg.proxy_port = args.port
-    server, _ = make_server(cfg)
+    server, cascade = make_server(cfg)
     logger.info(
         "ragfaith-proxy on http://%s:%d/v1 -> %s (judges: %s / %s via %s, nudge=%s)",
         cfg.proxy_host,
@@ -652,6 +773,7 @@ def main():
         pass
     finally:
         server.server_close()
+        cascade.close()
 
 
 if __name__ == "__main__":

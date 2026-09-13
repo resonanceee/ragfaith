@@ -62,8 +62,9 @@ client -> proxy -> upstream LLM
 - **Premises**: content the conversation actually pulled — `role: "tool"`
   messages and `tool_result` content blocks, capped to the most recent
   24k chars (`RFE_PREMISE_CAP`). A small per-conversation store covers clients
-  that do not resend full history; conversations are keyed by
-  `X-Conversation-Id`, else a hash of the message prefix, else Host header.
+  that do not resend full history (LRU-capped at 1000 conversations);
+  conversations are keyed by `X-Conversation-Id`, else a hash of the first
+  user message (full message list if none), else Host header.
 
 ## Nudge modes (`RFE_NUDGE_MODE`)
 
@@ -108,6 +109,7 @@ conversation and reconcile; do not invent corrections.
 | `RFE_HOST_CONFIG` | — | Path to same JSON map in a file |
 | `RFE_CACHE_DIR` | — | Append-only JSONL verdict cache dir |
 | `RFE_JUDGE_LOG` | stderr | File for session token log lines |
+| `RFE_MAX_BODY` | `10485760` | Max request body bytes (larger gets 413) |
 
 Per-host decorators are matched by the `X-RFE-Host` header (exact key), else
 by User-Agent substring, else `default`:
@@ -131,7 +133,8 @@ sha256 keys over model/context/claim). Unset: in-memory dict only.
 
 ## spaCy (optional)
 
-Claim decomposition uses `split_claims` from the main repo. With
+Claim decomposition uses `split_claims`, a vendored copy of
+`rag_faithfulness_eval.decompose` (copied, not imported). With
 `pip install ragfaith-proxy[spacy]` you get the benchmarked spaCy sentencizer
 path. Without it the proxy falls back to a regex sentence splitter and logs a
 prominent warning — claim boundaries may differ from benchmark results in

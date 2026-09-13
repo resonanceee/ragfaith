@@ -5,10 +5,13 @@ import http.client
 import json
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
+import ragfaith_proxy.judge as judge_mod
+import ragfaith_proxy.proxy as proxy_mod
 from ragfaith_proxy.decompose import split_claims
 from ragfaith_proxy.judge import Judge
 from ragfaith_proxy.proxy import (
@@ -69,7 +72,11 @@ class FakeHandler(BaseHTTPRequestHandler):
     def _judge(self, state, body):
         with state["lock"]:
             state["judge_calls"].append(body)
+            fail = state["judge_fail_status"]
             verdict = state["verdicts"].pop(0) if state["verdicts"] else "faithful"
+        if fail:
+            self._send_json({"error": "judge upstream boom"}, status=fail)
+            return
         resp = {
             "choices": [
                 {"message": {"content": json.dumps({"verdict": verdict})}, "finish_reason": "stop"}
@@ -82,6 +89,11 @@ class FakeHandler(BaseHTTPRequestHandler):
         with state["lock"]:
             state["requests"].append(body)
             idx = len(state["requests"]) - 1
+        fail = state["fail_status"]
+        fail_from = state["fail_from"]
+        if fail and (fail_from is None or idx >= fail_from):
+            self._send_json({"error": "upstream boom"}, status=fail)
+            return
         script = state["script"]
         entry = script[min(idx, len(script) - 1)]
         if body.get("stream"):
@@ -97,9 +109,9 @@ class FakeHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(entry["json"])
 
-    def _send_json(self, obj):
+    def _send_json(self, obj, status=200):
         raw = json.dumps(obj).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -116,6 +128,9 @@ def rig():
         "script": [],
         "delay": 0.0,
         "auths": [],
+        "fail_status": None,
+        "fail_from": None,
+        "judge_fail_status": None,
         "glm": "hf:zai-org/GLM-5.3-Flash",
         "deepseek": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
     }
@@ -150,6 +165,14 @@ def post(rig, payload, headers=None):
         body=json.dumps(payload),
         headers=base_headers,
     )
+    return conn, conn.getresponse()
+
+
+def raw_post(rig, headers, body=b""):
+    conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=10)
+    base_headers = {"Content-Type": "application/json", "Authorization": "Bearer test-token"}
+    base_headers.update(headers)
+    conn.request("POST", "/v1/chat/completions", body=body, headers=base_headers)
     return conn, conn.getresponse()
 
 
@@ -350,6 +373,7 @@ def test_select_judge():
     cfg = Config()
     assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.deepseek_model
     assert select_judge("glm-5.3-flash-instruct", cfg) == cfg.deepseek_model
+    assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.deepseek_model
     assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.glm_model
     assert select_judge("gpt-4o", cfg) == cfg.glm_model
 
@@ -503,3 +527,200 @@ def test_client_auth_forwarded(rig):
     with rig.state["lock"]:
         auths = list(rig.state["auths"])
     assert auths and all(a == "Bearer test-token" for a in auths)
+
+
+# ---------------------------------------------------------------- conversation identity
+
+
+def test_conv_key_separates_chats_with_shared_system_prompt(rig):
+    system = {"role": "system", "content": "You are a helpful assistant."}
+    chat_a = [system, {"role": "user", "content": "chat A question"}]
+    chat_b = [system, {"role": "user", "content": "chat B question"}]
+    key_a = rig.cascade.conv_key({}, chat_a)
+    key_b = rig.cascade.conv_key({}, chat_b)
+    assert key_a != key_b, "same system prompt must not collapse distinct chats"
+    later_a = chat_a + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more"}]
+    assert rig.cascade.conv_key({}, later_a) == key_a, "same chat later turn keeps the key"
+    assert rig.cascade.conv_key({"x-conversation-id": "conv-x"}, chat_a) == "conv-x"
+    # state never bleeds across the two chats
+    rig.cascade.record_messages(key_a, [{"role": "tool", "content": "premise A"}])
+    rig.cascade.record_messages(key_b, [{"role": "tool", "content": "premise B"}])
+    assert "premise A" in rig.cascade.premises(key_a)
+    assert "premise B" not in rig.cascade.premises(key_a)
+
+
+def test_conversation_store_lru_evicted(rig, monkeypatch):
+    monkeypatch.setattr(proxy_mod, "CONV_STORE_MAX", 2)
+    rig.cascade.record_messages("c1", [{"role": "user", "content": "1"}])
+    rig.cascade.record_messages("c2", [{"role": "user", "content": "2"}])
+    rig.cascade.premises("c1")  # refresh c1
+    rig.cascade.record_messages("c3", [{"role": "user", "content": "3"}])
+    assert set(rig.cascade._conv) == {"c1", "c3"}
+
+
+def test_judge_store_lru_evicted(rig, monkeypatch):
+    monkeypatch.setattr(proxy_mod, "JUDGE_STORE_MAX", 2)
+    j1 = rig.cascade.judge("m", "secret-token-1")
+    j2 = rig.cascade.judge("m", "secret-token-2")
+    assert rig.cascade.judge("m", "secret-token-1") is j1  # refresh j1
+    rig.cascade.judge("m", "secret-token-3")
+    assert j1 in rig.cascade._judges.values()
+    assert j2 not in rig.cascade._judges.values()
+    assert all("secret-token" not in k for k in rig.cascade._judges), "raw tokens never keys"
+
+
+def test_verdict_cache_lru_evicted(rig):
+    judge = Judge(rig.cfg.glm_model, rig.base, "k", vcache_max=2)
+    judge._store("k1", "faithful")
+    judge._store("k2", "unfaithful")
+    judge._store("k3", "faithful")
+    assert list(judge._vcache) == ["k2", "k3"]
+
+
+def test_incremental_client_accumulates_premises(rig):
+    conv = "incremental"
+    rig.cascade.record_messages(conv, [{"role": "tool", "content": "premise one"}])
+    rig.cascade.record_messages(conv, [{"role": "tool", "content": "premise two"}])
+    out = rig.cascade.premises(conv)
+    assert "premise one" in out, "shorter request must not drop stored history"
+    assert "premise two" in out, "new tool message must be stored"
+
+
+# ---------------------------------------------------------------- request body limits & validation
+
+
+def test_oversized_body_413(rig, monkeypatch):
+    monkeypatch.setattr(proxy_mod, "MAX_BODY", 64)
+    _, resp = raw_post(rig, {"Content-Length": "100"}, b"x" * 100)
+    resp.read()
+    assert resp.status == 413
+
+
+def test_malformed_content_length_400(rig):
+    _, resp = raw_post(rig, {"Content-Length": "abc"}, b"x")
+    resp.read()
+    assert resp.status == 400
+
+
+def test_negative_content_length_400(rig):
+    _, resp = raw_post(rig, {"Content-Length": "-1"}, b"x")
+    resp.read()
+    assert resp.status == 400
+
+
+def test_messages_wrong_type_400(rig):
+    _, resp = post(rig, {"model": "m", "messages": 42})
+    resp.read()
+    assert resp.status == 400
+
+
+def test_model_wrong_type_400(rig):
+    _, resp = post(rig, {"model": 42, "messages": [{"role": "user", "content": "x"}]})
+    resp.read()
+    assert resp.status == 400
+
+
+def test_internal_error_gets_500(rig, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rig.cascade, "conv_key", boom)
+    _, resp = post(rig, {"model": "m", "messages": [{"role": "user", "content": "x"}]})
+    resp.read()
+    assert resp.status == 500
+
+
+# ---------------------------------------------------------------- nudge never lost
+
+
+def test_nudge_restashed_on_upstream_non_200(rig):
+    rig.cascade.set_nudge("conv-fail", "pending nudge")
+    rig.state["fail_status"] = 500
+    _, resp = post(
+        rig,
+        {"model": "m", "messages": [{"role": "user", "content": "x"}]},
+        {"X-Conversation-Id": "conv-fail"},
+    )
+    resp.read()
+    assert resp.status == 500
+    assert rig.cascade.pop_nudge("conv-fail") == "pending nudge"
+
+
+def test_nudge_restashed_on_upstream_connect_error(rig, monkeypatch):
+    rig.cascade.set_nudge("conv-conn", "pending nudge")
+
+    def boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(proxy_mod, "upstream_request", boom)
+    _, resp = post(
+        rig,
+        {"model": "m", "messages": [{"role": "user", "content": "x"}]},
+        {"X-Conversation-Id": "conv-conn"},
+    )
+    resp.read()
+    assert resp.status == 502
+    assert rig.cascade.pop_nudge("conv-conn") == "pending nudge"
+
+
+def test_nudge_restashed_when_chain_fails(rig):
+    rig.state["script"] = [
+        {"stream": [chunk("The sky is green."), chunk(None, finish="stop"), DONE_LINE]}
+    ]
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["fail_from"] = 1
+    rig.state["fail_status"] = 502
+    _, resp = post(
+        rig,
+        {
+            "model": "m",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "color?"},
+                {"role": "tool", "content": "The sky is blue."},
+            ],
+        },
+        {"X-Conversation-Id": "conv-chain-fail"},
+    )
+    events = [line for line in iter_sse_lines(resp) if line.strip()]
+    assert events[-1] == "data: [DONE]"
+    assert wait_ends(rig.cascade, 1)
+    nudge = rig.cascade.pop_nudge("conv-chain-fail")
+    assert nudge is not None and "The sky is green." in nudge
+
+
+# ---------------------------------------------------------------- premises flattening
+
+
+def test_premises_flatten_nested_tool_result_content():
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": "part one"},
+                        {"type": "text", "text": "part two"},
+                    ],
+                },
+                {"type": "tool_result", "content": 123},  # defensive: non-text skipped
+            ],
+        }
+    ]
+    out = harvest_premises(msgs, 24000)
+    assert "part one" in out and "part two" in out
+
+
+# ---------------------------------------------------------------- judge retry budget
+
+
+def test_judge_retry_budget_bounded(rig, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(judge_mod.time, "sleep", lambda s: sleeps.append(s))
+    rig.state["judge_fail_status"] = 500
+    judge = Judge(rig.cfg.glm_model, rig.base, "k")
+    with pytest.raises(urllib.error.HTTPError):
+        judge.verdict("ctx", "claim")
+    assert len(rig.state["judge_calls"]) == judge_mod.RETRIES
+    assert sum(sleeps) <= 15, "retry sleeps must stay bounded"

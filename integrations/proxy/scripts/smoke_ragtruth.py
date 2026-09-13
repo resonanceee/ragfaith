@@ -22,7 +22,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ragfaith_proxy.judge import Judge, _parse_verdict, _verdict_key
 
-RESULTS = Path("/Users/res/Code/ragfaith/results")
+
+def _results_dir() -> Path:
+    env = os.environ.get("RFE_RESULTS_DIR")
+    if env:
+        return Path(env)
+    relative = Path(__file__).resolve().parents[3] / "results"  # <repo>/results
+    if relative.is_dir():
+        return relative
+    return Path("/Users/res/Code/ragfaith/results")  # last-resort legacy fallback
+
+
+RESULTS = _results_dir()
 CACHE_MODEL = "z-ai/glm-5.3-flash"  # openrouter id used when the cache was written
 N = 50
 SEED = 0

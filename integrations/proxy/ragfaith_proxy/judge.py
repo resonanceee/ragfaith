@@ -14,11 +14,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 VERDICTS = ("faithful", "unfaithful", "unverifiable")
+VCACHE_MAX = 10000
+RETRIES = 3  # streaming handler must not stall minutes on an upstream outage
 
 SYSTEM_PROMPT = (
     "You are a RAG faithfulness judge. / Du bist ein RAG-Treuerichter.\n"
@@ -55,6 +58,7 @@ class Judge:
         max_tokens: int = 256,
         cache_path: Path | None = None,
         log=None,
+        vcache_max: int = VCACHE_MAX,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -63,14 +67,15 @@ class Judge:
         self.cache_path = cache_path
         self._log = log or (lambda r: print(json.dumps(r), file=sys.stderr, flush=True))
         self._lock = threading.Lock()
-        self._vcache: dict[str, str] = {}
+        self._vcache_max = vcache_max
+        self._vcache: OrderedDict[str, str] = OrderedDict()
         if cache_path and cache_path.exists():
             for line in cache_path.read_text().splitlines():
                 if line.strip():
                     row = json.loads(line)
                     self._vcache[row["key"]] = row["verdict"]
 
-    def _call(self, user_msg: str, retries: int = 10, max_tokens: int | None = None) -> dict:
+    def _call(self, user_msg: str, retries: int = RETRIES, max_tokens: int | None = None) -> dict:
         body = json.dumps(
             {
                 "model": self.model,
@@ -102,7 +107,7 @@ class Judge:
                     continue
                 raise
             except (urllib.error.URLError, TimeoutError) as e:
-                # network drop: wait it out (up to 1 min per try, ~10 min total)
+                # network drop: bounded retry (<=15 s total sleep at 3 attempts)
                 if attempt < retries - 1:
                     logger.warning("network error (%s); retry %d/%d", e, attempt + 1, retries)
                     time.sleep(min(60, 5 * 2**attempt))
@@ -126,6 +131,7 @@ class Judge:
         key = _verdict_key(self.model, context, claim)
         with self._lock:
             if key in self._vcache:
+                self._vcache.move_to_end(key)
                 return self._vcache[key]
         msg = f"CONTEXT:\n{context}\n\nCLAIM:\n{claim}"
         for max_tokens in (self.max_tokens, self.max_tokens * 2):
@@ -145,6 +151,9 @@ class Judge:
     def _store(self, key: str, verdict: str) -> None:
         with self._lock:
             self._vcache[key] = verdict
+            self._vcache.move_to_end(key)
+            while len(self._vcache) > self._vcache_max:
+                self._vcache.popitem(last=False)
             if self.cache_path:
                 self.cache_path.parent.mkdir(parents=True, exist_ok=True)
                 with self.cache_path.open("a") as f:
