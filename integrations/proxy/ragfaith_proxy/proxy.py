@@ -49,6 +49,19 @@ DEFAULT_NUDGE = (
     "{verdict}: {claims}. Re-check against the sources actually pulled in this "
     "conversation and reconcile; do not invent corrections."
 )
+# regen mode: the nudge never reaches the client, so it can be directive —
+# the model must keep the re-check internal and output only a clean answer
+DEFAULT_REGEN_NUDGE = (
+    "Do not reply to this message, and do not mention it, judges, flags, "
+    "verification, or any re-checking process in your output. {n} claim(s) in "
+    "your draft reply were flagged as not directly supported by the pulled "
+    "sources: {claims}. Silently re-check them against the sources actually "
+    "pulled in this conversation. Keep all reconciliation inside your own "
+    "reasoning only. Then write your final answer as if directly answering "
+    "the user's original query: correct or drop any unsupported claims, keep "
+    "the supported ones unchanged, and output ONLY that answer — no tables, "
+    "no meta-commentary, no references to this correction."
+)
 SSE_DONE = object()
 
 # per-conversation store bounded so long sessions can't grow memory without limit
@@ -73,6 +86,7 @@ class Config:
     premise_cap: int = 24000
     nudge_mode: str = "chain"
     nudge_template: str = DEFAULT_NUDGE
+    regen_template: str = DEFAULT_REGEN_NUDGE
     cache_dir: str | None = None
     judge_log: str | None = None
     host_decorators: dict = field(default_factory=lambda: {"default": {}})
@@ -110,6 +124,8 @@ class Config:
             deepseek_model=deepseek,
             premise_cap=int(env.get("RFE_PREMISE_CAP", "24000")),
             nudge_mode=env.get("RFE_NUDGE_MODE", "chain"),
+            nudge_template=env.get("RFE_NUDGE_TEMPLATE", DEFAULT_NUDGE),
+            regen_template=env.get("RFE_REGEN_NUDGE", DEFAULT_REGEN_NUDGE),
             cache_dir=env.get("RFE_CACHE_DIR") or None,
             judge_log=env.get("RFE_JUDGE_LOG") or None,
             host_decorators=decorators,
@@ -550,6 +566,7 @@ def make_handler(cascade: Cascade):
             deco = resolve_host(cfg, self.headers)
             mode = deco.get("nudge_mode", cfg.nudge_mode)
             template = deco.get("template", cfg.nudge_template)
+            regen_template = deco.get("regen_template", cfg.regen_template)
             cascade.record_messages(conv, list(messages))
 
             pending = cascade.pop_nudge(conv)  # next-mode delivery
@@ -584,7 +601,7 @@ def make_handler(cascade: Cascade):
                     pass
                 return
             if mode == "regen":
-                self._regen(resp, conn, conv, payload, messages, judge_model, template, auth)
+                self._regen(resp, conn, conv, payload, messages, judge_model, regen_template, auth)
             elif payload.get("stream"):
                 self._stream(resp, conn, conv, payload, messages, judge_model, mode, template, auth)
             else:

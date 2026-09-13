@@ -295,8 +295,36 @@ def test_regen_flagged_client_sees_only_regen(rig):
         assert len(rig.state["requests"]) == 2
         internal = rig.state["requests"][1]
         assert internal["messages"][-1]["role"] == "user"
-        assert "ragfaith judge" in internal["messages"][-1]["content"]
+        nudge = internal["messages"][-1]["content"]
+        # regen template: directive, silent-correction contract
+        assert "Do not reply to this message" in nudge
+        assert "original query" in nudge
+        assert "ONLY that answer" in nudge
         assert not internal.get("stream")
+
+
+def test_regen_false_positive_gets_direct_answer_only(rig):
+    # judge false positive: model must still output one clean answer to the
+    # user, never a defense against the nudge (no tables, no meta)
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["script"] = [
+        {"stream": [chunk("It is in Paris, France.", finish="stop"), DONE_LINE]},
+        {
+            "json": full_msg(
+                "It is in Paris, France. The sources pulled in this "
+                "conversation place the tower in Paris."
+            )
+        },
+    ]
+    conn, resp = post(rig, _regen_payload(), headers={"X-Conversation-Id": "regen-fp"})
+    body = "".join(iter_sse_lines(resp))
+    conn.close()
+    # no judge/verification meta anywhere in the client-visible output
+    assert "ragfaith" not in body.lower()
+    assert "judge" not in body.lower()
+    assert "claim" not in body.lower()
+    assert "re-check" not in body.lower()
+    assert "It is in Paris, France." in body
 
 
 def test_regen_plain_client_flagged(rig):
