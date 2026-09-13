@@ -16,14 +16,15 @@ import {
   verdictKey,
   extractPackages,
   isGlmFlash,
+  isActiveJudgeModel,
   isSensitivePath,
   redactSecrets,
   maxClaims,
   RagfaithPlugin,
 } from "../src/index";
 
-const GLM = "hf:zai-org/GLM-5.3-Flash";
-const DS = "hf:deepseek-ai/DeepSeek-V4.1-Flash";
+const GLM = "test/glm-judge";
+const DS = "test/ds-judge";
 
 function fakeFetch(body: unknown, status = 200): typeof fetch {
   const resp = {
@@ -70,12 +71,15 @@ describe("claim segmentation", () => {
 
 describe("judge selection", () => {
   const cfg = resolveProvider({
-    RFE_JUDGE_PROVIDER: "synthetic",
+    RFE_JUDGE_GLM_MODEL: GLM,
+    RFE_JUDGE_DEEPSEEK_MODEL: DS,
   } as Record<string, string>);
 
   test("glm-flash active -> deepseek judge", () => {
     expect(selectJudgeModel(GLM, cfg)).toBe(DS);
     expect(selectJudgeModel("z-ai/glm-5.3-flash", cfg)).toBe(DS);
+    expect(selectJudgeModel("hf:zai-org/GLM-5.3-Flash", cfg)).toBe(DS);
+    expect(selectJudgeModel("z-ai/glm-5.3-flash:free", cfg)).toBe(DS);
   });
 
   test("anything else -> glm judge", () => {
@@ -87,12 +91,12 @@ describe("judge selection", () => {
   test("self-judge impossible when active model deliberately matches", () => {
     const judge = selectJudgeModel(GLM, cfg);
     expect(judge).not.toBe(GLM);
-    expect(judge.toLowerCase()).toContain("deepseek");
+    expect(judge).toBe(DS);
     // and if the deepseek judge itself were active, judge flips back to glm
     expect(selectJudgeModel(DS, cfg)).toBe(GLM);
   });
 
-  test("env overrides win", () => {
+  test("provider-specific env overrides win", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
       RFE_OPENROUTER_DEEPSEEK_MODEL: "custom/ds",
@@ -103,16 +107,41 @@ describe("judge selection", () => {
     expect(c.baseUrl).toBe("https://openrouter.ai/api/v1");
   });
 
-  test("synthetic provider-specific overrides win", () => {
+  test("generic env overrides win over provider-specific and defaults", () => {
     const c = resolveProvider({
-      RFE_SYNTHETIC_GLM_MODEL: "s/glm",
-      RFE_SYNTHETIC_DEEPSEEK_MODEL: "s/ds",
+      RFE_JUDGE_PROVIDER: "openrouter",
+      RFE_OPENROUTER_GLM_MODEL: "preset/glm",
+      RFE_JUDGE_GLM_MODEL: "any-provider/glm",
+      RFE_JUDGE_DEEPSEEK_MODEL: "any-provider/ds",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("s/glm");
-    expect(c.deepseekModel).toBe("s/ds");
+    expect(c.glmModel).toBe("any-provider/glm");
+    expect(c.deepseekModel).toBe("any-provider/ds");
   });
 
-  test("openrouter defaults match proxy model ids", () => {
+  test("any OpenAI-compatible provider + custom ids works (no hf/ shape needed)", () => {
+    const c = resolveProvider({
+      RFE_JUDGE_PROVIDER: "my-endpoint",
+      RFE_JUDGE_BASE_URL: "https://llm.internal/v1",
+      RFE_JUDGE_API_KEY: "k",
+      RFE_JUDGE_GLM_MODEL: "openai/gpt-oss-120b",
+      RFE_JUDGE_DEEPSEEK_MODEL: "mistral/magistral-small",
+    } as Record<string, string>);
+    expect(c.baseUrl).toBe("https://llm.internal/v1");
+    expect(c.apiKey).toBe("k");
+    const active = selectJudgeModel("openai/gpt-oss-120b", c);
+    expect(active).toBe("mistral/magistral-small");
+    expect(selectJudgeModel("other/model", c)).toBe("openai/gpt-oss-120b");
+  });
+
+  test("synthetic preset defaults", () => {
+    const c = resolveProvider({
+      RFE_JUDGE_PROVIDER: "synthetic",
+    } as Record<string, string>);
+    expect(c.glmModel).toBe("hf:zai-org/GLM-5.3-Flash");
+    expect(c.deepseekModel).toBe("hf:deepseek-ai/DeepSeek-V4.1-Flash");
+  });
+
+  test("openrouter preset defaults", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
     } as Record<string, string>);
@@ -120,10 +149,18 @@ describe("judge selection", () => {
     expect(c.deepseekModel).toBe("deepseek/deepseek-v4.1-flash");
   });
 
-  test("non-5.3 glm-flash is not treated as self-judging", () => {
+  test("active-model check references the configured glm model, not a fixed id", () => {
     expect(isGlmFlash("z-ai/glm-5-flash")).toBe(false);
     expect(selectJudgeModel("z-ai/glm-5-flash", cfg)).toBe(GLM);
-    expect(isGlmFlash("hf:zai-org/GLM-5.3-Flash")).toBe(true);
+    const c = resolveProvider({
+      RFE_JUDGE_PROVIDER: "custom",
+      RFE_JUDGE_GLM_MODEL: "local/glm-5.3-flash",
+      RFE_JUDGE_DEEPSEEK_MODEL: "local/ds",
+    } as Record<string, string>);
+    expect(isActiveJudgeModel("local/glm-5.3-flash", c)).toBe(true);
+    expect(isActiveJudgeModel("local/glm-5.3-flash:free", c)).toBe(true);
+    expect(selectJudgeModel("local/glm-5.3-flash", c)).toBe("local/ds");
+    expect(selectJudgeModel("local/glm-5-flash", c)).toBe("local/glm-5.3-flash");
   });
 });
 
@@ -205,7 +242,7 @@ describe("cache", () => {
       sleepImpl: noSleep,
     });
     await judge.verdict("ctx", "claim");
-    const file = join(dir, "opencode-cache-hf_zai-org_GLM-5.3-Flash.jsonl");
+    const file = join(dir, "opencode-cache-test_glm-judge.jsonl");
     expect(existsSync(file)).toBe(true);
     const row = JSON.parse(readFileSync(file, "utf8").trim());
     expect(row.key).toBe(verdictKey(GLM, "ctx", "claim"));
@@ -267,7 +304,7 @@ describe("cache", () => {
   test("registry memoizes cache per judge model (no re-read)", () => {
     process.env["RFE_CACHE_DIR"] = dir;
     const key = verdictKey(GLM, "a", "b");
-    const file = join(dir, "opencode-cache-hf_zai-org_GLM-5.3-Flash.jsonl");
+    const file = join(dir, "opencode-cache-test_glm-judge.jsonl");
     writeFileSync(file, JSON.stringify({ key, verdict: "faithful" }) + "\n");
     const registry = makeCacheRegistry();
     expect(registry(GLM).get(key)).toBe("faithful");
@@ -393,7 +430,7 @@ describe("nudge aggregation", () => {
       { claim: "Moon is cheese.", verdict: "unverifiable" },
     ]);
     expect(nudge).toContain("2 claim(s)");
-    expect(nudge).toContain(GLM);
+    expect(nudge).toContain("test/glm-judge");
     expect(nudge).toContain("unfaithful (1)");
     expect(nudge).toContain("unverifiable (1)");
     expect(nudge).toContain("do not invent corrections");

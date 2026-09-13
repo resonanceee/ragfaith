@@ -26,7 +26,6 @@ const VERDICT_RE = /"verdict"\s*:\s*"(\w+)"/;
 const DEFAULT_PREMISE_CAP = 24_000;
 const DEFAULT_PREMISE_TOOLS = "read|fetch|web|doc|search";
 const DEFAULT_MAX_CLAIMS = 50;
-const GLM_FLASH_MARK = "glm-5.3-flash";
 const PACKAGE_RE = /@?[a-z0-9][a-z0-9._\/-]*/gi;
 
 // ---------------------------------------------------------------------------
@@ -72,7 +71,7 @@ export function redactSecrets(text: string): string {
 // ---------------------------------------------------------------------------
 
 export interface JudgeProviderConfig {
-  provider: "synthetic" | "openrouter";
+  provider: string;
   baseUrl: string;
   apiKey: string;
   glmModel: string;
@@ -82,27 +81,26 @@ export interface JudgeProviderConfig {
 export function resolveProvider(
   env: Record<string, string | undefined> = process.env,
 ): JudgeProviderConfig {
-  const provider = (
-    env["RFE_JUDGE_PROVIDER"] === "openrouter" ? "openrouter" : "synthetic"
-  ) as "synthetic" | "openrouter";
-  if (provider === "openrouter") {
-    return {
-      provider,
-      baseUrl: "https://openrouter.ai/api/v1",
-      apiKey: env["OPENROUTER_API_KEY"] ?? "",
-      glmModel: env["RFE_OPENROUTER_GLM_MODEL"] ?? "z-ai/glm-5.3-flash",
-      deepseekModel:
-        env["RFE_OPENROUTER_DEEPSEEK_MODEL"] ?? "deepseek/deepseek-v4.1-flash",
-    };
-  }
-  return {
-    provider,
-    baseUrl: "https://api.synthetic.new/v1",
-    apiKey: env["SYNTHETIC_API_KEY"] ?? "",
-    glmModel: env["RFE_SYNTHETIC_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash",
-    deepseekModel:
-      env["RFE_SYNTHETIC_DEEPSEEK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash",
-  };
+  const provider = env["RFE_JUDGE_PROVIDER"] ?? "synthetic";
+  const isOpenRouter = provider === "openrouter";
+  const baseUrl =
+    env["RFE_JUDGE_BASE_URL"] ??
+    (isOpenRouter ? "https://openrouter.ai/api/v1" : "https://api.synthetic.new/v1");
+  const apiKey =
+    env["RFE_JUDGE_API_KEY"] ?? (isOpenRouter ? env["OPENROUTER_API_KEY"] : env["SYNTHETIC_API_KEY"]) ?? "";
+  // generic model overrides take precedence over provider-specific vars, so any
+  // OpenAI-compatible endpoint works without synthetic-style model ids
+  const glmModel =
+    env["RFE_JUDGE_GLM_MODEL"] ??
+    (isOpenRouter
+      ? env["RFE_OPENROUTER_GLM_MODEL"] ?? "z-ai/glm-5.3-flash"
+      : env["RFE_SYNTHETIC_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash");
+  const deepseekModel =
+    env["RFE_JUDGE_DEEPSEEK_MODEL"] ??
+    (isOpenRouter
+      ? env["RFE_OPENROUTER_DEEPSEEK_MODEL"] ?? "deepseek/deepseek-v4.1-flash"
+      : env["RFE_SYNTHETIC_DEEPSEEK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash");
+  return { provider, baseUrl, apiKey, glmModel, deepseekModel };
 }
 
 function premiseToolsRegex(
@@ -151,16 +149,31 @@ export function segmentClaims(text: string): string[] {
 // judge selection
 // ---------------------------------------------------------------------------
 
-export function isGlmFlash(model: string): boolean {
-  return model.toLowerCase().includes(GLM_FLASH_MARK);
+export function isGlmFlash(model: string, pattern = "glm-5.3-flash"): boolean {
+  return normalizeModelId(model).includes(pattern.toLowerCase());
 }
 
-/** Never self-judge: GLM-5.3-Flash active -> DeepSeek judge; else GLM judge. */
+// provider prefixes ("hf:org/", "z-ai/") carry no identity; strip to the base id
+function normalizeModelId(model: string): string {
+  return (model.toLowerCase().split("/").pop() ?? model).split(":")[0] ?? model;
+}
+
+/** True when the active model is the configured GLM judge (or the built-in
+ *  GLM-5.3-Flash preset), ignoring provider prefix / ":" variants, so a custom
+ *  GLM model id still gets never-self-judge protection. */
+export function isActiveJudgeModel(activeModel: string, cfg: JudgeProviderConfig): boolean {
+  const active = normalizeModelId(activeModel);
+  const candidates = [normalizeModelId(cfg.glmModel)];
+  if (cfg.glmModel !== "glm-5.3-flash") candidates.push("glm-5.3-flash");
+  return candidates.some((c) => c !== "" && active.includes(c));
+}
+
+/** Never self-judge: active model is the GLM judge -> DeepSeek judge; else GLM. */
 export function selectJudgeModel(
   activeModel: string,
   cfg: JudgeProviderConfig,
 ): string {
-  return isGlmFlash(activeModel) ? cfg.deepseekModel : cfg.glmModel;
+  return isActiveJudgeModel(activeModel, cfg) ? cfg.deepseekModel : cfg.glmModel;
 }
 
 // ---------------------------------------------------------------------------
