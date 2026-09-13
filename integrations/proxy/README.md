@@ -86,8 +86,18 @@ client -> proxy -> upstream LLM
 - **`next`**: the nudge is stashed per conversation and injected as a user
   message right after the flagged assistant message in the next request's
   history.
+- **`regen`**: the whole reply is buffered, claims are judged, and the client
+  sees exactly one assistant response — the original when faithful, a
+  regenerated one (from the internal nudged call) when flagged. The nudge and
+  the original flawed text never reach the client. **Latency caveat**: the
+  client waits for generation + judging before anything is shown; there is no
+  stream-through in this mode.
 
 All-faithful replies are fully silent: no extra call, no injection.
+
+Judging parallelism: per-claim judge calls within one cascade run concurrently
+(`RFE_JUDGE_WORKERS`, default 8) — one judge round-trip per reply instead of
+one per claim.
 
 Default nudge template:
 
@@ -114,7 +124,8 @@ conversation and reconcile; do not invent corrections.
 | `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter preset) |
 | `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
 | `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
-| `RFE_NUDGE_MODE` | `chain` | `chain` or `next` |
+| `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
+| `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |
 | `RFE_HOST_CONFIG` | — | Path to same JSON map in a file |

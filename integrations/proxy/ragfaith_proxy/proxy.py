@@ -2,9 +2,9 @@
 
 Point any OpenAI-compatible host tool's base URL at this proxy. Streaming
 replies stream through byte-for-byte (first token never delayed) while a copy
-is buffered; once the reply completes, claims are judged against the premises
-actually pulled in the conversation (tool results). Flagged claims trigger one
-aggregated corrective nudge, delivered per RFE_NUDGE_MODE:
+is buffered; once the reply completes, claims are judged in parallel against
+the premises actually pulled in the conversation (tool results). Flagged
+claims trigger one aggregated corrective nudge, delivered per RFE_NUDGE_MODE:
 
 - chain (default): withhold the stream close, issue one internal continuation
   call (original messages + assistant reply + nudge), stream it down the same
@@ -12,6 +12,11 @@ aggregated corrective nudge, delivered per RFE_NUDGE_MODE:
 - next: stash the nudge and inject it into the next request from the same
   conversation, right after the flagged assistant message. Non-streaming
   requests always fall back to this (chain needs a stream to append to).
+- regen: buffer the whole reply, judge, then show the client exactly one
+  assistant response — the original when faithful, a regenerated one (from
+  the internal nudged call) when flagged. The nudge itself never reaches the
+  client. Costs first-token latency: the client waits for generation plus
+  judging before anything is shown.
 
 Every cascade failure degrades to clean passthrough. Stdlib only.
 """
@@ -28,6 +33,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,6 +55,9 @@ SSE_DONE = object()
 CONV_MESSAGE_CAP = 128
 CONV_STORE_MAX = 1000
 JUDGE_STORE_MAX = 100
+
+# concurrent per-claim judge calls inside one cascade evaluation
+JUDGE_WORKERS = int(os.environ.get("RFE_JUDGE_WORKERS", "8"))
 MAX_BODY = int(os.environ.get("RFE_MAX_BODY", str(10 * 1024 * 1024)))
 
 
@@ -399,16 +408,19 @@ class Cascade:
         if not premises:
             return []
         judge = self.judge(judge_model, token)
-        flagged = []
-        for claim in claims:
+
+        def _verdict(claim: str):
             try:
-                verdict = judge.verdict(premises, claim, conversation=conv)
+                return claim, judge.verdict(premises, claim, conversation=conv)
             except Exception as e:  # noqa: BLE001 - cascade must never break passthrough
                 self.log({"kind": "judge-error", "error": str(e), "conversation": conv})
-                continue
-            if verdict != "faithful":
-                flagged.append((claim, verdict))
-        return flagged
+                return claim, None
+
+        # claims are independent: judge them concurrently (one judge round-trip
+        # instead of one per claim); pool.map keeps result order stable
+        with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
+            results = list(pool.map(_verdict, claims))
+        return [(c, v) for c, v in results if v not in (None, "faithful")]
 
 
 def _norm(path: str) -> str:
@@ -571,7 +583,9 @@ def make_handler(cascade: Cascade):
                 except OSError:
                     pass
                 return
-            if payload.get("stream"):
+            if mode == "regen":
+                self._regen(resp, conn, conv, payload, messages, judge_model, template, auth)
+            elif payload.get("stream"):
                 self._stream(resp, conn, conv, payload, messages, judge_model, mode, template, auth)
             else:
                 self._plain(resp, conn, conv, judge_model, mode, auth)
@@ -707,6 +721,198 @@ def make_handler(cascade: Cascade):
                     self.wfile.flush()
                 except OSError:
                     pass
+            cascade.note_end(reason, conv)
+
+        def _regen(self, resp, conn, conv, payload, messages, judge_model, template, auth):
+            """regen mode: buffer the whole upstream reply, judge in parallel,
+            then show the client exactly one assistant response — the original
+            when faithful, the regenerated one when flagged. The nudge itself
+            never reaches the client. Fail-open: any regen failure replays the
+            original reply."""
+            client_stream = bool(payload.get("stream"))
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            finish = None
+            sse_lines: list[bytes] = []
+            plain_raw = b""
+            dead = False
+            try:
+                if client_stream:
+                    buf = b""
+                    while True:
+                        block = resp.read1(8192)
+                        if not block:
+                            break
+                        buf += block
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            event = parse_sse_line(line)
+                            if event is SSE_DONE:
+                                continue
+                            sse_lines.append(line + b"\n")
+                            if isinstance(event, dict):
+                                finish = consume_delta(event, text_parts, tool_calls) or finish
+                    if buf and parse_sse_line(buf) is not SSE_DONE:
+                        sse_lines.append(buf)
+                else:
+                    plain_raw = resp.read()
+            except OSError:
+                dead = True
+            finally:
+                conn.close()
+
+            if dead:
+                cascade.note_end("disconnected", conv)
+                return
+
+            original = {"role": "assistant", "content": "".join(text_parts) or None}
+            if not client_stream:
+                try:
+                    data = json.loads(plain_raw)
+                    choice = (data.get("choices") or [{}])[0]
+                    original = dict(choice.get("message") or original)
+                    finish = choice.get("finish_reason")
+                except (json.JSONDecodeError, IndexError):
+                    pass  # malformed upstream payload: passthrough untouched
+            if tool_calls and not original.get("tool_calls"):
+                original["tool_calls"] = tool_calls
+
+            assistant_text = original.get("content") or ""
+            tool_turn = bool(original.get("tool_calls")) and not assistant_text.strip()
+
+            if tool_turn or finish != "stop" or not assistant_text.strip():
+                # nothing judgeable: replay the original untouched
+                try:
+                    if client_stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for line in sse_lines:
+                            self.wfile.write(line)
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(plain_raw)))
+                        self.end_headers()
+                        self.wfile.write(plain_raw)
+                        self.wfile.flush()
+                    cascade.record_reply(conv, original)
+                    cascade.note_end("passthrough", conv)
+                except OSError:
+                    cascade.note_end("disconnected", conv)
+                return
+
+            reason = "faithful"
+            seen = original
+            regen_raw = b""
+            try:
+                flagged = cascade.evaluate(conv, judge_model, assistant_text, _bearer_token(auth))
+                if flagged:
+                    nudge = render_template(template, **_nudge_args(judge_model, flagged))
+                    regen_payload = dict(
+                        payload,
+                        messages=[
+                            *messages,
+                            {"role": "assistant", "content": assistant_text},
+                            {"role": "user", "content": nudge},
+                        ],
+                        stream=False,
+                    )
+                    regen_raw = b""
+                    try:
+                        r2, c2 = upstream_request(
+                            cfg,
+                            "POST",
+                            "/chat/completions",
+                            json.dumps(regen_payload).encode(),
+                            auth=auth,
+                        )
+                        status2 = r2.status
+                        regen_raw = r2.read() if status2 == 200 else b""
+                        c2.close()
+                        if status2 == 200:
+                            data2 = json.loads(regen_raw)
+                            msg2 = (data2.get("choices") or [{}])[0].get("message") or {}
+                            if (msg2.get("content") or "").strip():
+                                seen, reason = msg2, "regenerated"
+                            else:
+                                cascade.log(
+                                    {"kind": "regen-error", "error": "empty", "conversation": conv}
+                                )
+                        else:
+                            cascade.log(
+                                {"kind": "regen-error", "status": status2, "conversation": conv}
+                            )
+                    except (OSError, json.JSONDecodeError) as e:
+                        cascade.log({"kind": "regen-error", "error": str(e), "conversation": conv})
+
+                # deliver exactly one assistant response
+                if reason == "regenerated":
+                    if client_stream:
+                        rid = f"ragfaith-regen-{int(time.time() * 1000)}"
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        first = {
+                            "id": rid,
+                            "object": "chat.completion.chunk",
+                            "model": payload.get("model", ""),
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": seen.get("content")},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        last = {
+                            "id": rid,
+                            "object": "chat.completion.chunk",
+                            "model": payload.get("model", ""),
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        self.wfile.write(b"data: " + json.dumps(first).encode() + b"\n\n")
+                        self.wfile.write(b"data: " + json.dumps(last).encode() + b"\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(regen_raw)))
+                        self.end_headers()
+                        self.wfile.write(regen_raw)
+                        self.wfile.flush()
+                else:
+                    if client_stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for line in sse_lines:
+                            self.wfile.write(line)
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(plain_raw)))
+                        self.end_headers()
+                        self.wfile.write(plain_raw)
+                        self.wfile.flush()
+            except OSError:
+                cascade.note_end("disconnected", conv)
+                return
+            except Exception as e:  # noqa: BLE001 - cascade failures never break delivery
+                cascade.log({"kind": "cascade-error", "error": str(e), "conversation": conv})
+                reason = "cascade-error"
+            cascade.record_reply(conv, seen)
             cascade.note_end(reason, conv)
 
         def _chain(self, conv, payload, messages, assistant_text, nudge, auth):
