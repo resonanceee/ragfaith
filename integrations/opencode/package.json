@@ -23,8 +23,7 @@
     "@opencode-ai/sdk": "^1.18.30",
     "@types/node": "^24.0.0",
     "bun-types": "^1.2.17",
-    "typescript": "^5.5.0"
+    "typescript": "^5.6.0"
   },
-  "license": "MIT",
-  "packageManager": "bun@1.2.17"
+  "license": "MIT"
 }
