@@ -27,7 +27,7 @@ def _get_nlp():  # lazy: spacy is an optional extra, the proxy must not need it
         nlp.add_pipe("sentencizer")
         _nlp = nlp
     except ImportError:
-        # ponytail: spaCy parity is the benchmarked path; regex is the no-dep fallback
+        # spaCy parity is the benchmarked path; regex is the no-dep fallback
         logger.warning(
             "spaCy not installed: using regex sentence splitter (degraded claim "
             "boundaries). Install ragfaith-proxy[spacy] for benchmark parity."

@@ -46,7 +46,7 @@ DEFAULT_NUDGE = (
 GLM_FLASH_MARK = "glm-5.3-flash"
 SSE_DONE = object()
 
-# ponytail: per-conversation store bounded so long sessions can't grow memory without limit
+# per-conversation store bounded so long sessions can't grow memory without limit
 CONV_MESSAGE_CAP = 128
 CONV_STORE_MAX = 1000
 JUDGE_STORE_MAX = 100
