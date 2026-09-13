@@ -91,7 +91,12 @@ client -> proxy -> upstream LLM
   regenerated one (from the internal nudged call) when flagged. The nudge and
   the original flawed text never reach the client. **Latency caveat**: the
   client waits for generation + judging before anything is shown; there is no
-  stream-through in this mode.
+  stream-through in this mode. The regen nudge uses a directive template
+  (`RFE_REGEN_NUDGE`, per-host key `regen_template`): the model is told to
+  keep the re-check inside its own reasoning and output only a direct answer
+  to the user's original query — no tables, no meta-commentary, no references
+  to the judge. This keeps false-positive flags from turning into visible
+  reconciliation essays.
 
 All-faithful replies are fully silent: no extra call, no injection.
 
@@ -125,6 +130,8 @@ conversation and reconcile; do not invent corrections.
 | `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
 | `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
 | `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
+| `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
+| `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
 | `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |
