@@ -136,7 +136,7 @@ export function maxClaims(
 
 /** Split reply text into sentence-granularity claims via Intl.Segmenter. */
 export function segmentClaims(text: string): string[] {
-  // ponytail: sentence-boundary drift vs spaCy sentencizer; swap in a real
+  // sentence-boundary drift vs spaCy sentencizer; swap in a real
   // segmenter lib if parity matters
   const seg = new Intl.Segmenter(undefined, { granularity: "sentence" });
   const claims: string[] = [];
