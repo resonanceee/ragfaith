@@ -1,0 +1,26 @@
+name: publish-gpr
+
+# Publishes the opencode plugin to GitHub Packages (npm.pkg.github.com).
+# Manual trigger; version comes from integrations/opencode/package.json.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+      - name: Publish @resonanceee/opencode-ragfaith
+        working-directory: integrations/opencode
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
