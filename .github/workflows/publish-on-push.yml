@@ -1,0 +1,88 @@
+name: publish-on-push
+
+# Auto-publishes integrations when their version changes on main.
+# Registries reject duplicate versions, so each job first checks whether the
+# version in the manifest is new; unchanged versions are a no-op.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Skip if version already published
+        id: gate
+        working-directory: integrations/opencode
+        run: |
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view @resonanceee/opencode-ragfaith version 2>/dev/null || echo "")
+          echo "local=$LOCAL remote=${REMOTE:-none}"
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish to npmjs
+        if: steps.gate.outputs.publish == 'true'
+        working-directory: integrations/opencode
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to GitHub Packages
+        if: steps.gate.outputs.publish == 'true'
+        working-directory: integrations/opencode
+        run: |
+          echo "@resonanceee:registry=https://npm.pkg.github.com" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
+          npm publish --registry=https://npm.pkg.github.com --access public
+
+  proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Skip if version already published
+        id: gate
+        run: |
+          LOCAL=$(python - <<'EOF'
+          import re, pathlib
+          print(re.search(r'version = "([^"]+)"', pathlib.Path("integrations/proxy/pyproject.toml").read_text()).group(1))
+          EOF
+          )
+          REMOTE=$(curl -sf https://pypi.org/pypi/ragfaith-proxy/json | python -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo "")
+          echo "local=$LOCAL remote=${REMOTE:-none}"
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        if: steps.gate.outputs.publish == 'true'
+        working-directory: integrations/proxy
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+      - name: Publish to PyPI
+        if: steps.gate.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: integrations/proxy/dist
+          password: ${{ secrets.PYPI_API_KEY }}
