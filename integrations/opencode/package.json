@@ -26,5 +26,12 @@
     "typescript": "^5.6.0"
   },
   "license": "MIT",
-  "packageManager": "npm@11.17.0+sha512.3eeaf18997b11070d313849268b23766b9db0068997dec9471073170fe43fa17f2b4d0337bf0f52330ee2274e7f5754b21b01052742e48f5c9c74d8b1e32ef43"
+  "packageManager": "npm@11.17.0+sha512.3eeaf18997b11070d313849268b23766b9db0068997dec9471073170fe43fa17f2b4d0337bf0f52330ee2274e7f5754b21b01052742e48f5c9c74d8b1e32ef43",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/resonanceee/ragfaith.git",
+    "directory": "integrations/opencode"
+  },
+  "homepage": "https://github.com/resonanceee/ragfaith/tree/main/integrations/opencode#readme",
+  "bugs": "https://github.com/resonanceee/ragfaith/issues"
 }
