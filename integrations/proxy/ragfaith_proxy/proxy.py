@@ -439,18 +439,37 @@ def make_handler(cascade: Cascade):
             if _norm(self.path) != "/v1/models":
                 self.send_error(404)
                 return
+            status = None
+            raw = b""
+            ctype = "application/json"
             try:
                 resp, conn = upstream_request(
                     cfg, "GET", "/v1/models", auth=self.headers.get("Authorization", "")
                 )
+                status = resp.status
                 raw = resp.read()
+                ctype = resp.getheader("Content-Type") or "application/json"
                 conn.close()
             except OSError as e:
                 cascade.log({"kind": "upstream-error", "error": str(e)})
-                self.send_error(502, "upstream connect failed")
-                return
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+            if status in (404, 405, None):
+                # upstream has no model listing (or is unreachable): serve a
+                # minimal static list so clients that require enumeration
+                # before allowing manual model IDs can still onboard
+                fallback = {
+                    "object": "list",
+                    "data": [
+                        {"id": cfg.glm_model, "object": "model", "owned_by": "ragfaith-proxy"},
+                        {
+                            "id": cfg.deepseek_model,
+                            "object": "model",
+                            "owned_by": "ragfaith-proxy",
+                        },
+                    ],
+                }
+                status, raw, ctype = 200, json.dumps(fallback).encode(), "application/json"
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             try:

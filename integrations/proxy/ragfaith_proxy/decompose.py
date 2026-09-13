@@ -26,11 +26,17 @@ def _get_nlp():  # lazy: spacy is an optional extra, the proxy must not need it
         nlp = spacy.blank("en")
         nlp.add_pipe("sentencizer")
         _nlp = nlp
-    except ImportError:
-        # spaCy parity is the benchmarked path; regex is the no-dep fallback
+    except Exception as e:  # noqa: BLE001 - missing extra OR broken install; degrade, never crash
+        # blank("en") + sentencizer is the benchmark path and needs no model
+        # download — the [spacy] extra alone is enough. If this still fails,
+        # the spaCy install itself is broken (e.g. missing system libraries);
+        # surface the underlying error instead of a generic hint.
         logger.warning(
-            "spaCy not installed: using regex sentence splitter (degraded claim "
-            "boundaries). Install ragfaith-proxy[spacy] for benchmark parity."
+            "spaCy unavailable (%s: %s): using regex sentence splitter (degraded "
+            "claim boundaries). 'pip install ragfaith-proxy[spacy]' is sufficient; "
+            "no model download is required.",
+            type(e).__name__,
+            e,
         )
 
         def regex_nlp(text: str):

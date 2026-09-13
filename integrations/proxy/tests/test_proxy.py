@@ -57,6 +57,14 @@ class FakeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         with self.server.state["lock"]:
             self.server.state["auths"].append(self.headers.get("Authorization", ""))
+        forced = self.server.state.get("models_status")
+        if forced is not None:
+            self.send_response(forced)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            return
         self._send_json({"object": "list", "data": [{"id": "fake-model"}]})
 
     def do_POST(self):
@@ -523,6 +531,29 @@ def test_models_passthrough(rig):
     resp = conn.getresponse()
     assert resp.status == 200
     assert json.loads(resp.read())["data"][0]["id"] == "fake-model"
+
+
+def test_models_fallback_on_upstream_404(rig):
+    # some upstreams have no model listing; the proxy must serve a static
+    # list so clients that require enumeration can onboard
+    rig.state["models_status"] = 404
+    conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=10)
+    conn.request("GET", "/v1/models", headers={"Authorization": "Bearer test-token"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    assert resp.status == 200
+    assert data["object"] == "list"
+    assert [m["id"] for m in data["data"]] == [rig.cfg.glm_model, rig.cfg.deepseek_model]
+
+
+def test_models_upstream_401_passthrough(rig):
+    # auth problems must not be masked by the fallback
+    rig.state["models_status"] = 401
+    conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=10)
+    conn.request("GET", "/v1/models", headers={"Authorization": "Bearer bad"})
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.status == 401
 
 
 def test_auth_required(rig):
