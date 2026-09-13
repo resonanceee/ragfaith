@@ -71,6 +71,10 @@ is rejected by most upstreams.
 - **chain mode** (default): a self-correction streams into the same reply.
 - **next mode** (`RFE_NUDGE_MODE=next`): the nudge rides in with your next
   message.
+- **regen mode** (`RFE_NUDGE_MODE=regen`): the client sees only the final
+  response — the original when faithful, a clean regenerated one when claims
+  were flagged. The nudge is never visible; the cost is a longer silent wait
+  (generation + judging) before text appears.
 
 Faithful replies stay completely silent.
 

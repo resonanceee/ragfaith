@@ -80,8 +80,13 @@ class FakeHandler(BaseHTTPRequestHandler):
     def _judge(self, state, body):
         with state["lock"]:
             state["judge_calls"].append(body)
+            state["judge_active"] = state.get("judge_active", 0) + 1
+            state["judge_max_conc"] = max(state.get("judge_max_conc", 0), state["judge_active"])
             fail = state["judge_fail_status"]
             verdict = state["verdicts"].pop(0) if state["verdicts"] else "faithful"
+        time.sleep(state.get("judge_delay", 0.0))
+        with state["lock"]:
+            state["judge_active"] -= 1
         if fail:
             self._send_json({"error": "judge upstream boom"}, status=fail)
             return
@@ -135,6 +140,7 @@ def rig():
         "verdicts": [],
         "script": [],
         "delay": 0.0,
+        "judge_delay": 0.0,
         "auths": [],
         "fail_status": None,
         "fail_from": None,
@@ -205,6 +211,105 @@ def wait_ends(cascade, n, timeout=10):
             return True
         time.sleep(0.02)
     return False
+
+
+# ---------------------------------------------------------------- parallel judging
+
+
+def test_judge_calls_run_in_parallel(rig):
+    rig.state["judge_delay"] = 0.4
+    rig.state["verdicts"] = ["unfaithful"] * 3
+    rig.state["script"] = [{"stream": [chunk("Alpha. Beta. Gamma.", finish="stop"), DONE_LINE]}]
+    conn, resp = post(
+        rig,
+        {
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {
+                    "role": "tool",
+                    "tool_call_id": "t1",
+                    "content": "Alpha is A. Beta is B. Gamma is G.",
+                },
+                {"role": "user", "content": "q"},
+            ],
+        },
+        headers={"X-Conversation-Id": "par"},
+    )
+    start = time.monotonic()
+    list(iter_sse_lines(resp))
+    conn.close()
+    elapsed = time.monotonic() - start
+    with rig.state["lock"]:
+        n = len(rig.state["judge_calls"])
+        max_conc = rig.state.get("judge_max_conc", 0)
+    assert n == 3
+    assert max_conc >= 2  # overlapped, not sequential
+    assert elapsed < 3 * 0.4  # sequential would be >= 1.2s
+
+
+# ---------------------------------------------------------------- regen mode
+
+
+def _regen_payload(stream=True):
+    return {
+        "model": "gpt-4o",
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "Where is the tower? Use the source."},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "tool", "tool_call_id": "t1", "content": "The tower is in Paris, France."},
+            {"role": "user", "content": "Answer using the source."},
+        ],
+    }
+
+
+def test_regen_faithful_replays_original_only(rig):
+    rig.cfg.nudge_mode = "regen"
+    rig.state["script"] = [{"stream": [chunk("It is in Paris.", finish="stop"), DONE_LINE]}]
+    conn, resp = post(rig, _regen_payload(), headers={"X-Conversation-Id": "regen-f"})
+    body = "".join(iter_sse_lines(resp))
+    conn.close()
+    assert "It is in Paris." in body
+    with rig.state["lock"]:
+        assert len(rig.state["requests"]) == 1  # no internal regen call
+        assert len(rig.state["judge_calls"]) == 1
+
+
+def test_regen_flagged_client_sees_only_regen(rig):
+    rig.cfg.nudge_mode = "regen"
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["script"] = [
+        {"stream": [chunk("It is in Munich.", finish="stop"), DONE_LINE]},
+        {"json": full_msg("It is in Paris, France.")},  # internal regen call
+    ]
+    conn, resp = post(rig, _regen_payload(), headers={"X-Conversation-Id": "regen-u"})
+    body = "".join(iter_sse_lines(resp))
+    conn.close()
+    assert "It is in Paris, France." in body  # regenerated text
+    assert "Munich" not in body  # original never shown
+    assert "ragfaith judge" not in body  # nudge never shown
+    assert body.count("[DONE]") == 1
+    with rig.state["lock"]:
+        assert len(rig.state["requests"]) == 2
+        internal = rig.state["requests"][1]
+        assert internal["messages"][-1]["role"] == "user"
+        assert "ragfaith judge" in internal["messages"][-1]["content"]
+        assert not internal.get("stream")
+
+
+def test_regen_plain_client_flagged(rig):
+    rig.cfg.nudge_mode = "regen"
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["script"] = [
+        {"json": full_msg("It is in Munich.")},
+        {"json": full_msg("It is in Paris, France.")},
+    ]
+    conn, resp = post(rig, _regen_payload(stream=False), headers={"X-Conversation-Id": "regen-p"})
+    data = json.loads(resp.read())
+    conn.close()
+    assert data["choices"][0]["message"]["content"] == "It is in Paris, France."
 
 
 # ---------------------------------------------------------------- stream passthrough
