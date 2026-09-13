@@ -13,6 +13,18 @@ aggregated nudge injected back into the session. Faithful replies are silent.
 npm install @resonanceee/opencode-ragfaith
 ```
 
+Registry pages: [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) ·
+[GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith)
+
+The package is also published to GitHub Packages under the same name and
+versioning:
+
+```sh
+# one-time: auth with a token that has read:packages
+npm login --scope=@resonanceee --registry=https://npm.pkg.github.com
+npm install @resonanceee/opencode-ragfaith --registry=https://npm.pkg.github.com
+```
+
 ```jsonc
 // ~/.config/opencode/opencode.json (or project .opencode/opencode.json)
 {

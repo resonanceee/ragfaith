@@ -251,6 +251,8 @@ You can also copy `integrations/opencode/src/index.ts` to `~/.config/opencode/pl
 
 The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrouter` plus `OPENROUTER_API_KEY`.
 
+Published on [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) and [GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith).
+
 Setup guide: [integrations/opencode/QUICKSTART.md](integrations/opencode/QUICKSTART.md)
 
 ## Development
