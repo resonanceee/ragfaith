@@ -13,9 +13,14 @@ Pure Python stdlib. No third-party runtime dependencies.
 ## Install & run
 
 ```sh
-pip install .
-ragfaith-proxy                    # listens on 127.0.0.1:8787
+pip install ragfaith-proxy         # from PyPI
+ragfaith-proxy                     # listens on 127.0.0.1:8787
 ```
+
+Registry page: [pypi.org/project/ragfaith-proxy](https://pypi.org/project/ragfaith-proxy/) ·
+also attached to [GitHub releases](https://github.com/resonanceee/ragfaith/releases).
+
+From a checkout instead: `pip install .`
 
 Tests (no network): `pip install .[dev] && pytest -q`
 

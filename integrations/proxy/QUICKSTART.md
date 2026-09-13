@@ -8,6 +8,12 @@ in about two minutes.
 Requires Python 3.11+. No third-party runtime dependencies.
 
 ```sh
+pip install ragfaith-proxy         # from PyPI
+```
+
+From a checkout instead:
+
+```sh
 cd integrations/proxy
 pip install .
 ```

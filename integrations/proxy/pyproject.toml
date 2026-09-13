@@ -16,5 +16,10 @@ dev = ["pytest>=8", "ruff>=0.6"]
 [project.scripts]
 ragfaith-proxy = "ragfaith_proxy.proxy:main"
 
+[project.urls]
+Homepage = "https://github.com/resonanceee/ragfaith/tree/main/integrations/proxy"
+Repository = "https://github.com/resonanceee/ragfaith"
+Issues = "https://github.com/resonanceee/ragfaith/issues"
+
 [tool.setuptools.packages.find]
 include = ["ragfaith_proxy*"]

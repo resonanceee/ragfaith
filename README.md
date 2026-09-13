@@ -213,9 +213,8 @@ The proxy does not store an API key. It forwards the client's `Authorization` he
 Install:
 
 ```sh
-cd integrations/proxy
-pip install .
-ragfaith-proxy          # http://127.0.0.1:8787
+pip install ragfaith-proxy         # from PyPI
+ragfaith-proxy                     # http://127.0.0.1:8787
 ```
 
 Then point any OpenAI compatible client at:
@@ -225,6 +224,8 @@ http://127.0.0.1:8787/v1
 ```
 
 and provide your provider key as usual.
+
+Published on [PyPI](https://pypi.org/project/ragfaith-proxy/).
 
 Setup guide: [integrations/proxy/QUICKSTART.md](integrations/proxy/QUICKSTART.md)
 
