@@ -1,0 +1,293 @@
+{
+  "pairs": {
+    "rt-test-5037-c2": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-7012-c6": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-9730-c3": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-8624-c3": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-13070-c3": {
+      "cache": "unfaithful",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unverifiable",
+      "deepseek_parse_failed": true
+    },
+    "rt-test-15008-c2": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-7779-c1": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-6932-c3": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-12261-c6": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-1514-c1": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-12104-c10": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-11458-c4": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-2372-c3": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-8766-c0": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-1729-c14": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-3639-c4": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-12840-c12": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-7784-c2": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-7024-c5": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-1238-c1": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-9842-c1": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-14817-c4": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-13493-c5": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-12261-c7": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-16636-c13": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-7092-c0": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-15208-c0": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-13265-c2": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-10363-c0": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-1568-c3": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-15788-c0": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-13431-c10": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-12016-c3": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-6676-c8": {
+      "cache": "faithful",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-7090-c2": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-7009-c9": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-9577-c2": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-11182-c7": {
+      "cache": "unfaithful",
+      "glm_verdict": "unfaithful",
+      "deepseek_verdict": "unfaithful"
+    },
+    "rt-test-14290-c9": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-14772-c1": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-7204-c4": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-9881-c9": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-10351-c1": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-15555-c10": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "deepseek_verdict": "unverifiable"
+    },
+    "rt-test-1674-c2": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-11295-c0": {
+      "cache": "faithful",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unverifiable",
+      "deepseek_parse_failed": true
+    },
+    "rt-test-2238-c5": {
+      "cache": "unverifiable",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-906-c9": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-2736-c2": {
+      "cache": "faithful",
+      "glm_verdict": "faithful",
+      "deepseek_verdict": "faithful"
+    },
+    "rt-test-13042-c14": {
+      "cache": "unverifiable",
+      "glm_verdict": "unverifiable",
+      "glm_parse_failed": true,
+      "deepseek_verdict": "unverifiable"
+    }
+  },
+  "summary": {
+    "glm": {
+      "n": 50,
+      "dist": {
+        "unfaithful": 13,
+        "faithful": 26,
+        "unverifiable": 11
+      },
+      "parse_failures": 6,
+      "prompt_tokens": 59863,
+      "completion_tokens": 16708,
+      "exact_match": "46/50 (92.0%)",
+      "exact_match_non_unverifiable": "38/38 (100.0%)",
+      "confusion": {
+        "cache=unfaithful syn=unverifiable": 1,
+        "cache=faithful syn=unverifiable": 2,
+        "cache=unverifiable syn=faithful": 1
+      }
+    },
+    "deepseek": {
+      "n": 50,
+      "dist": {
+        "unfaithful": 15,
+        "faithful": 26,
+        "unverifiable": 9
+      },
+      "parse_failures": 2,
+      "prompt_tokens": 58906,
+      "completion_tokens": 12511
+    }
+  }
+}
