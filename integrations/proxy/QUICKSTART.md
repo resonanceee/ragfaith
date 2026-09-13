@@ -48,9 +48,25 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ## 4. Give it something to verify
 
 The cascade judges each assistant reply against what was actually pulled.
-Pull content via a tool call (or include `role: "tool"` messages in the
-request), then ask the model a question. If a reply claims something the
-pulled sources don't support, you'll see the nudge:
+Pull content via a tool call, or include tool results in the request.
+Upstreams require a well-formed tool exchange, so include the
+`assistant`/`tool_call_id` scaffolding:
+
+```json
+{
+  "model": "<your-model>",
+  "messages": [
+    {"role": "user", "content": "Where is the Eiffel Tower? Use the source you fetched."},
+    {"role": "assistant", "content": "", "tool_calls": []},
+    {"role": "tool", "tool_call_id": "t1",
+     "content": "The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France."},
+    {"role": "user", "content": "Answer the question using the source."}
+  ]
+}
+```
+
+A bare `{"role": "tool", "content": "..."}` message without `tool_call_id`
+is rejected by most upstreams.
 
 - **chain mode** (default): a self-correction streams into the same reply.
 - **next mode** (`RFE_NUDGE_MODE=next`): the nudge rides in with your next
