@@ -15,6 +15,7 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  id-token: write  # OIDC trusted publishing (npmjs + PyPI); no long-lived tokens
 
 jobs:
   plugin:
@@ -23,8 +24,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24  # bundles npm >= 11.5.1 (trusted publishing minimum)
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Skip if version already published
         id: gate
         working-directory: integrations/opencode
@@ -41,8 +43,6 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         working-directory: integrations/opencode
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish to GitHub Packages
         if: steps.gate.outputs.publish == 'true'
         working-directory: integrations/opencode
@@ -80,9 +80,8 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           twine check dist/*
-      - name: Publish to PyPI
+      - name: Publish to PyPI (trusted publishing, OIDC)
         if: steps.gate.outputs.publish == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: integrations/proxy/dist
-          password: ${{ secrets.PYPI_API_KEY }}
