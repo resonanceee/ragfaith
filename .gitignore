@@ -10,3 +10,6 @@ MID_EXPERIMENT_FINDINGS.md
 *.log
 .env
 models/
+
+.DS_Store
+HANDOFF.md

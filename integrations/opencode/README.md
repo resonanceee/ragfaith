@@ -7,7 +7,20 @@ aggregated nudge injected back into the session. Faithful replies are silent.
 
 ## Install
 
-### Option A — local file copy (working today)
+### Option A — npm
+
+```sh
+npm install @resonanceee/opencode-ragfaith
+```
+
+```jsonc
+// ~/.config/opencode/opencode.json (or project .opencode/opencode.json)
+{
+  "plugin": ["@resonanceee/opencode-ragfaith"]
+}
+```
+
+### Option B — local file copy
 
 The whole plugin is one self-contained TS file (type-only imports are erased
 at load, so no runtime deps). It uses the opencode v1 plugin module shape
@@ -20,22 +33,6 @@ cp src/index.ts ~/.config/opencode/plugins/ragfaith.ts
 ```
 
 opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
-
-### Option B — npm (after publish)
-
-The package is not published to npm yet; this will 404 until then. Once
-published:
-
-```sh
-npm install @resonanceee/opencode-ragfaith
-```
-
-```jsonc
-// ~/.config/opencode/opencode.json (or project .opencode/opencode.json)
-{
-  "plugin": ["@resonanceee/opencode-ragfaith"]
-}
-```
 
 ## Behavior
 
