@@ -26,7 +26,6 @@ jobs:
         with:
           node-version: 24  # bundles npm >= 11.5.1 (trusted publishing minimum)
           registry-url: https://registry.npmjs.org
-          package-manager-cache: false
       - name: Skip if version already published
         id: gate
         working-directory: integrations/opencode
@@ -47,9 +46,10 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         working-directory: integrations/opencode
         run: |
-          echo "@resonanceee:registry=https://npm.pkg.github.com" >> ~/.npmrc
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
-          npm publish --registry=https://npm.pkg.github.com --access public
+          # setup-node points NPM_CONFIG_USERCONFIG at its own .npmrc; use an
+          # isolated config so the GPR token is actually picked up
+          printf '@resonanceee:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=%s\n' "${{ secrets.GITHUB_TOKEN }}" > "$RUNNER_TEMP/gpr.npmrc"
+          npm publish --access public --registry=https://npm.pkg.github.com --userconfig "$RUNNER_TEMP/gpr.npmrc"
 
   proxy:
     runs-on: ubuntu-latest
