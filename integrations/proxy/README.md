@@ -56,9 +56,12 @@ client -> proxy -> upstream LLM
 ```
 
 - **Model detection**: the request's `model` field is the active model.
-- **Judge selection** (never self-judge): if the active model is
-  GLM-5.3-Flash, DeepSeek-V4.1-Flash judges; anything else is judged by
-  GLM-5.3-Flash.
+- **Judge selection** (never self-judge): the active model is compared against
+  the configured GLM judge model (provider prefixes and `:` variants ignored).
+  A match is judged by the configured DeepSeek model; anything else is judged
+  by the configured GLM model. Both models are configurable for any
+  OpenAI-compatible endpoint via `RFE_JUDGE_GLM_MODEL` /
+  `RFE_JUDGE_DEEPSEEK_MODEL` — no `hf:`-style id shape required.
 - **Premises**: content the conversation actually pulled — `role: "tool"`
   messages and `tool_result` content blocks, capped to the most recent
   24k chars (`RFE_PREMISE_CAP`). A small per-conversation store covers clients
@@ -96,11 +99,14 @@ conversation and reconcile; do not invent corrections.
 | `RFE_PROXY_HOST` | `127.0.0.1` | Listen address |
 | `RFE_PROXY_PORT` | `8787` | Listen port |
 | `RFE_UPSTREAM_BASE` | `https://api.synthetic.new/v1` | Upstream OpenAI-compatible base |
-| `RFE_JUDGE_PROVIDER` | `synthetic` | `synthetic` or `openrouter` |
-| `RFE_SYNTHETIC_BASE` | upstream base | Judge base URL (synthetic) |
-| `RFE_SYNTHETIC_GLM_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Primary judge model |
-| `RFE_SYNTHETIC_DEEPSEEK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when active model is GLM |
-| `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter) |
+| `RFE_JUDGE_PROVIDER` | `synthetic` | Preset: `synthetic` or `openrouter` (free-form with generic vars) |
+| `RFE_JUDGE_BASE` | preset | Generic judge base URL; overrides preset |
+| `RFE_JUDGE_GLM_MODEL` | preset | Generic primary judge model; overrides preset |
+| `RFE_JUDGE_DEEPSEEK_MODEL` | preset | Generic GLM-active judge model; overrides preset |
+| `RFE_SYNTHETIC_BASE` | upstream base | Judge base URL (synthetic preset) |
+| `RFE_SYNTHETIC_GLM_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Primary judge model (synthetic preset) |
+| `RFE_SYNTHETIC_DEEPSEEK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when active model is GLM (synthetic preset) |
+| `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter preset) |
 | `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
 | `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
 | `RFE_NUDGE_MODE` | `chain` | `chain` or `next` |
@@ -110,6 +116,17 @@ conversation and reconcile; do not invent corrections.
 | `RFE_CACHE_DIR` | — | Append-only JSONL verdict cache dir |
 | `RFE_JUDGE_LOG` | stderr | File for session token log lines |
 | `RFE_MAX_BODY` | `10485760` | Max request body bytes (larger gets 413) |
+
+Precedence: generic `RFE_JUDGE_*` vars → preset vars (`RFE_SYNTHETIC_*` /
+`RFE_OPENROUTER_*`, selected by `RFE_JUDGE_PROVIDER`) → built-in defaults.
+Example — judge with any OpenAI-compatible endpoint:
+
+```sh
+export RFE_JUDGE_PROVIDER=my-endpoint        # preset name is free-form
+export RFE_JUDGE_BASE=http://llm.internal/v1
+export RFE_JUDGE_GLM_MODEL=openai/gpt-oss-120b
+export RFE_JUDGE_DEEPSEEK_MODEL=mistral/magistral-small
+```
 
 Per-host decorators are matched by the `X-RFE-Host` header (exact key), else
 by User-Agent substring, else `default`:

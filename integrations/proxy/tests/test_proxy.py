@@ -131,8 +131,8 @@ def rig():
         "fail_status": None,
         "fail_from": None,
         "judge_fail_status": None,
-        "glm": "hf:zai-org/GLM-5.3-Flash",
-        "deepseek": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+        "glm": "test/glm-judge",
+        "deepseek": "test/ds-judge",
     }
     fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeHandler)
     fake.daemon_threads = True
@@ -143,6 +143,8 @@ def rig():
         proxy_port=0,
         upstream_base=base,
         judge_base=base,
+        glm_model=state["glm"],
+        deepseek_model=state["deepseek"],
     )
     server, cascade = make_server(cfg)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -372,10 +374,17 @@ def test_client_disconnect_mid_chain_no_hang(rig):
 def test_select_judge():
     cfg = Config()
     assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.deepseek_model
-    assert select_judge("glm-5.3-flash-instruct", cfg) == cfg.deepseek_model
     assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.deepseek_model
+    assert select_judge("glm-4.6-flash-instruct", cfg) == cfg.glm_model
     assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.glm_model
     assert select_judge("gpt-4o", cfg) == cfg.glm_model
+
+
+def test_select_judge_custom_configured_model():
+    cfg = Config(glm_model="local/glm-5.3-flash", deepseek_model="local/ds")
+    assert select_judge("local/glm-5.3-flash", cfg) == "local/ds"
+    assert select_judge("local/glm-5.3-flash:free", cfg) == "local/ds"
+    assert select_judge("local/glm-4.6-flash", cfg) == "local/glm-5.3-flash"
 
 
 def test_verdict_garbage_falls_back_to_unverifiable(rig):
@@ -491,6 +500,21 @@ def test_config_from_env():
     assert cfg.host_decorators["flowdown"]["nudge_mode"] == "next"
     # client-auth-only: no key fields exist on the config
     assert not hasattr(cfg, "upstream_key") and not hasattr(cfg, "judge_key")
+
+
+def test_config_from_env_generic_overrides_any_provider():
+    env = {
+        "RFE_JUDGE_PROVIDER": "my-endpoint",
+        "RFE_JUDGE_BASE": "http://llm.internal/v1",
+        "RFE_JUDGE_GLM_MODEL": "openai/gpt-oss-120b",
+        "RFE_JUDGE_DEEPSEEK_MODEL": "mistral/magistral-small",
+    }
+    cfg = Config.from_env(env)
+    assert cfg.judge_base == "http://llm.internal/v1"
+    assert cfg.glm_model == "openai/gpt-oss-120b"
+    assert cfg.deepseek_model == "mistral/magistral-small"
+    assert select_judge("openai/gpt-oss-120b", cfg) == "mistral/magistral-small"
+    assert select_judge("other/model", cfg) == "openai/gpt-oss-120b"
 
 
 def test_models_passthrough(rig):

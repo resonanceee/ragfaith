@@ -43,7 +43,6 @@ DEFAULT_NUDGE = (
     "{verdict}: {claims}. Re-check against the sources actually pulled in this "
     "conversation and reconcile; do not invent corrections."
 )
-GLM_FLASH_MARK = "glm-5.3-flash"
 SSE_DONE = object()
 
 # per-conversation store bounded so long sessions can't grow memory without limit
@@ -83,6 +82,10 @@ class Config:
             )
             glm = env.get("RFE_SYNTHETIC_GLM_MODEL", "hf:zai-org/GLM-5.3-Flash")
             deepseek = env.get("RFE_SYNTHETIC_DEEPSEEK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
+        # generic overrides take precedence: any OpenAI-compatible judge works
+        judge_base = env.get("RFE_JUDGE_BASE", judge_base)
+        glm = env.get("RFE_JUDGE_GLM_MODEL", glm)
+        deepseek = env.get("RFE_JUDGE_DEEPSEEK_MODEL", deepseek)
         decorators = {"default": {}}
         if env.get("RFE_HOST_CONFIG"):
             decorators.update(json.loads(Path(env["RFE_HOST_CONFIG"]).read_text()))
@@ -104,9 +107,18 @@ class Config:
         )
 
 
+def _bare_model_id(model: str) -> str:
+    """Last path segment without the ':' variant suffix ('hf:zai-org/GLM-5.3-Flash'
+    -> 'glm-5.3-flash', 'z-ai/glm-5.3-flash:free' -> 'glm-5.3-flash')."""
+    return model.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+
+
 def select_judge(active_model: str, cfg: Config) -> str:
-    """Never self-judge: GLM-5.3-Flash replies are judged by DeepSeek-V4.1-Flash."""
-    if GLM_FLASH_MARK in active_model.lower():
+    """Never self-judge: active model matching the configured GLM judge is judged
+    by the configured DeepSeek model; anything else by the configured GLM model."""
+    active = _bare_model_id(active_model)
+    glm = _bare_model_id(cfg.glm_model)
+    if active and (glm == active or glm in active):
         return cfg.deepseek_model
     return cfg.glm_model
 
