@@ -25,7 +25,47 @@ export const SYSTEM_PROMPT =
 const VERDICT_RE = /"verdict"\s*:\s*"(\w+)"/;
 const DEFAULT_PREMISE_CAP = 24_000;
 const DEFAULT_PREMISE_TOOLS = "read|fetch|web|doc|search";
+const DEFAULT_MAX_CLAIMS = 50;
+const GLM_FLASH_MARK = "glm-5.3-flash";
 const PACKAGE_RE = /@?[a-z0-9][a-z0-9._\/-]*/gi;
+
+// ---------------------------------------------------------------------------
+// privacy: sensitive paths + secret redaction (no deps, applied before store)
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_PATH_RE =
+  /(?:^|[\\/"'\s:=])(?:\.env(?:\.[\w.-]+)?|\.npmrc|\.netrc|\.ssh[\\/]|\.aws[\\/]credentials|id_rsa|id_ed25519|credentials|[\w.-]+\.(?:pem|key|p12))(?=$|[\\/"'\s,}\]])/i;
+
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    "[REDACTED PRIVATE KEY]",
+  ],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]"],
+  [/\bsk-[A-Za-z0-9_-]{8,}/g, "sk-[REDACTED]"],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g, "Bearer [REDACTED]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED AWS KEY]"],
+  [/\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b/g, "[REDACTED GITHUB TOKEN]"],
+  [
+    /\baws_secret_access_key\s*[:=]\s*["']?[A-Za-z0-9/+=]{16,}["']?/gi,
+    "aws_secret_access_key=[REDACTED]",
+  ],
+  [
+    /\b(api[_-]?key|token|secret|password)\s*[:=]\s*["'][^"'\n]{8,}["']/gi,
+    "$1=[REDACTED]",
+  ],
+];
+
+export function isSensitivePath(args: unknown): boolean {
+  const s = typeof args === "string" ? args : JSON.stringify(args ?? "");
+  return SENSITIVE_PATH_RE.test(s);
+}
+
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const [re, repl] of SECRET_PATTERNS) out = out.replace(re, repl);
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // env config (read lazily so tests can set env per case)
@@ -50,18 +90,18 @@ export function resolveProvider(
       provider,
       baseUrl: "https://openrouter.ai/api/v1",
       apiKey: env["OPENROUTER_API_KEY"] ?? "",
-      glmModel: env["RFE_JUDGE_GLM_MODEL"] ?? "z-ai/glm-5.3-flash",
+      glmModel: env["RFE_OPENROUTER_GLM_MODEL"] ?? "z-ai/glm-5.3-flash",
       deepseekModel:
-        env["RFE_JUDGE_DS_MODEL"] ?? "deepseek/deepseek-chat-v4.1-flash",
+        env["RFE_OPENROUTER_DEEPSEEK_MODEL"] ?? "deepseek/deepseek-v4.1-flash",
     };
   }
   return {
     provider,
     baseUrl: "https://api.synthetic.new/v1",
     apiKey: env["SYNTHETIC_API_KEY"] ?? "",
-    glmModel: env["RFE_JUDGE_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash",
+    glmModel: env["RFE_SYNTHETIC_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash",
     deepseekModel:
-      env["RFE_JUDGE_DS_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash",
+      env["RFE_SYNTHETIC_DEEPSEEK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash",
   };
 }
 
@@ -81,6 +121,13 @@ function premiseCap(
 ): number {
   const n = Number.parseInt(env["RFE_PREMISE_CAP"] ?? "", 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_PREMISE_CAP;
+}
+
+export function maxClaims(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const n = Number.parseInt(env["RFE_MAX_CLAIMS"] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_CLAIMS;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +152,7 @@ export function segmentClaims(text: string): string[] {
 // ---------------------------------------------------------------------------
 
 export function isGlmFlash(model: string): boolean {
-  const m = model.toLowerCase();
-  return m.includes("glm-5") && m.includes("flash");
+  return model.toLowerCase().includes(GLM_FLASH_MARK);
 }
 
 /** Never self-judge: GLM-5.3-Flash active -> DeepSeek judge; else GLM judge. */
@@ -184,6 +230,21 @@ export function makeCache(
   };
 }
 
+/** Plugin-scope cache memo: one loaded cache per judge model, reused replies. */
+export function makeCacheRegistry(
+  env: Record<string, string | undefined> = process.env,
+): (judgeModel: string) => VerdictCache {
+  const caches = new Map<string, VerdictCache>();
+  return (judgeModel) => {
+    let c = caches.get(judgeModel);
+    if (!c) {
+      c = makeCache(judgeModel, env);
+      caches.set(judgeModel, c);
+    }
+    return c;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // logging: token lines only, never USD
 // ---------------------------------------------------------------------------
@@ -235,9 +296,12 @@ interface ChatResp {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
+class NonRetryableHttpError extends Error {}
+
 export class Judge {
   readonly checkpoint: string;
   parseErrors = 0;
+  callFailures = 0;
   private readonly o: Required<Omit<JudgeOptions, "cache">> & {
     cache?: VerdictCache;
   };
@@ -280,13 +344,19 @@ export class Judge {
             body,
           },
         );
-        if ([429, 500, 502, 503].includes(resp.status) && attempt < retries - 1) {
+        const retryable = resp.status === 429 || resp.status >= 500;
+        if (retryable && attempt < retries - 1) {
           await this.o.sleepImpl(2 ** attempt * 1000);
           continue;
         }
-        if (!resp.ok) throw new Error(`judge HTTP ${resp.status}`);
+        if (!resp.ok) {
+          throw retryable
+            ? new Error(`judge HTTP ${resp.status}`)
+            : new NonRetryableHttpError(`judge HTTP ${resp.status}`);
+        }
         return (await resp.json()) as ChatResp;
       } catch (e) {
+        if (e instanceof NonRetryableHttpError) throw e;
         lastErr = e;
         if (attempt < retries - 1) {
           // network drop: wait it out (up to 1 min per try)
@@ -338,11 +408,12 @@ export class Judge {
       } else {
         verdict = parsed;
       }
+      this.o.cache?.store(key, verdict);
     } catch (e) {
-      // network/HTTP exhausted retries: conservative, logged
+      // network/HTTP exhausted retries: conservative, logged, never cached
+      this.callFailures += 1;
       logErr("judge-call", e, this.o.logFile || undefined);
     }
-    this.o.cache?.store(key, verdict);
     return verdict;
   }
 }
@@ -465,6 +536,7 @@ function makeState(): SessionState {
 
 export const RagfaithPlugin: Plugin = async ({ client }) => {
   const states = new Map<string, SessionState>();
+  const cacheOf = makeCacheRegistry();
   const logFile = process.env["RFE_JUDGE_LOG"] || undefined;
   const toolsRe = premiseToolsRegex();
 
@@ -517,11 +589,25 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         apiKey: provider.apiKey,
         model: judgeModel,
         session: sessionID,
-        cache: makeCache(judgeModel),
+        cache: cacheOf(judgeModel),
         logFile: logFile ?? "",
       });
+      const claims = segmentClaims(text);
+      const kept = claims.slice(0, maxClaims());
+      if (kept.length < claims.length) {
+        logLine(
+          {
+            ts: new Date().toISOString(),
+            session: sessionID,
+            kind: "claims-skipped",
+            judged: kept.length,
+            skipped: claims.length - kept.length,
+          },
+          logFile,
+        );
+      }
       const flagged: FlaggedClaim[] = [];
-      for (const claim of segmentClaims(text)) {
+      for (const claim of kept) {
         const v = await judge.verdict(context, claim);
         if (v === "unfaithful" || v === "unverifiable") {
           flagged.push({ claim, verdict: v });
@@ -539,7 +625,7 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           body: {
             messageID: nudgeId,
             noReply: true,
-            parts: [{ type: "text", text: nudge }],
+            parts: [{ type: "text", text: nudge, synthetic: true }],
           },
         });
       } catch (e) {
@@ -586,14 +672,28 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
     "tool.execute.after": async (input, output) => {
       try {
         if (!toolsRe.test(input.tool)) return;
+        if (isSensitivePath(input.args)) {
+          logLine(
+            {
+              ts: new Date().toISOString(),
+              session: input.sessionID,
+              kind: "skip",
+              reason: "sensitive path, premise not captured",
+              tool: input.tool,
+            },
+            logFile,
+          );
+          return;
+        }
         const text =
           typeof output.output === "string"
             ? output.output
             : JSON.stringify(output.output ?? "");
         if (!text) return;
+        const safe = redactSecrets(text);
         const st = stateOf(input.sessionID);
-        st.premises.append(text);
-        for (const t of extractDocTokens(text)) st.docTokens.add(t);
+        st.premises.append(safe);
+        for (const t of extractDocTokens(safe)) st.docTokens.add(t);
       } catch (e) {
         logErr("premise-capture", e, logFile);
       }
@@ -611,6 +711,10 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
 
     event: async ({ event }: { event: Event }) => {
       try {
+        if (event.type === "session.deleted") {
+          states.delete(event.properties.info.id);
+          return;
+        }
         if (event.type === "message.part.updated") {
           const part = event.properties.part;
           if (part.type === "text" && part.text) {
