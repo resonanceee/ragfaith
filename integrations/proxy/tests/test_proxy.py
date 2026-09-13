@@ -52,10 +52,14 @@ class FakeHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        with self.server.state["lock"]:
+            self.server.state["auths"].append(self.headers.get("Authorization", ""))
         self._send_json({"object": "list", "data": [{"id": "fake-model"}]})
 
     def do_POST(self):
         state = self.server.state
+        with state["lock"]:
+            state["auths"].append(self.headers.get("Authorization", ""))
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body.get("model") in (state["glm"], state["deepseek"]):
             self._judge(state, body)
@@ -111,6 +115,7 @@ def rig():
         "verdicts": [],
         "script": [],
         "delay": 0.0,
+        "auths": [],
         "glm": "hf:zai-org/GLM-5.3-Flash",
         "deepseek": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
     }
@@ -122,9 +127,7 @@ def rig():
     cfg = Config(
         proxy_port=0,
         upstream_base=base,
-        upstream_key="k",
         judge_base=base,
-        judge_key="k",
     )
     server, cascade = make_server(cfg)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -139,11 +142,13 @@ def rig():
 
 def post(rig, payload, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=30)
+    base_headers = {"Content-Type": "application/json", "Authorization": "Bearer test-token"}
+    base_headers.update(headers or {})
     conn.request(
         "POST",
         "/v1/chat/completions",
         body=json.dumps(payload),
-        headers={"Content-Type": "application/json", **(headers or {})},
+        headers=base_headers,
     )
     return conn, conn.getresponse()
 
@@ -447,26 +452,54 @@ def test_inject_nudge_after_last_assistant():
 def test_config_from_env():
     env = {
         "RFE_UPSTREAM_BASE": "http://x/v1",
-        "SYNTHETIC_API_KEY": "sk",
         "RFE_PREMISE_CAP": "100",
         "RFE_NUDGE_MODE": "next",
         "RFE_JUDGE_PROVIDER": "openrouter",
-        "OPENROUTER_API_KEY": "ok",
         "RFE_HOST_DECORATORS": json.dumps(
             {"flowdown": {"nudge_mode": "next", "template": "t {n}"}}
         ),
     }
     cfg = Config.from_env(env)
-    assert cfg.upstream_base == "http://x/v1" and cfg.upstream_key == "sk"
+    assert cfg.upstream_base == "http://x/v1"
     assert cfg.premise_cap == 100 and cfg.nudge_mode == "next"
-    assert cfg.judge_base == "https://openrouter.ai/api/v1" and cfg.judge_key == "ok"
+    assert cfg.judge_base == "https://openrouter.ai/api/v1"
     assert cfg.glm_model == "z-ai/glm-5.3-flash"
     assert cfg.host_decorators["flowdown"]["nudge_mode"] == "next"
+    # client-auth-only: no key fields exist on the config
+    assert not hasattr(cfg, "upstream_key") and not hasattr(cfg, "judge_key")
 
 
 def test_models_passthrough(rig):
     conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=10)
-    conn.request("GET", "/v1/models")
+    conn.request("GET", "/v1/models", headers={"Authorization": "Bearer test-token"})
     resp = conn.getresponse()
     assert resp.status == 200
     assert json.loads(resp.read())["data"][0]["id"] == "fake-model"
+
+
+def test_auth_required(rig):
+    conn = http.client.HTTPConnection("127.0.0.1", rig.port, timeout=10)
+    conn.request(
+        "POST",
+        "/v1/chat/completions",
+        body=json.dumps({"model": "gpt-4o", "messages": []}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.status == 401
+
+
+def test_client_auth_forwarded(rig):
+    rig.state["script"] = [{"stream": [chunk("hi", finish="stop"), DONE_LINE]}]
+    conn, resp = post(
+        rig,
+        {"model": "gpt-4o", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-Conversation-Id": "auth-test"},
+    )
+    assert resp.status == 200
+    list(iter_sse_lines(resp))
+    conn.close()
+    with rig.state["lock"]:
+        auths = list(rig.state["auths"])
+    assert auths and all(a == "Bearer test-token" for a in auths)

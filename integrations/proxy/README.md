@@ -14,11 +14,19 @@ Pure Python stdlib. No third-party runtime dependencies.
 
 ```sh
 pip install .
-export SYNTHETIC_API_KEY=...      # upstream + judge key for the default provider
 ragfaith-proxy                    # listens on 127.0.0.1:8787
 ```
 
 Tests (no network): `pip install .[dev] && pytest -q`
+
+## Authentication: client-auth-only
+
+The proxy holds **no API key of its own**. Every client request must carry its
+own `Authorization: Bearer <provider key>` header, which the proxy forwards to
+the upstream verbatim. The client's token also authenticates the judge calls
+that request's cascade triggers. Requests without an `Authorization` header
+get 401. Consequence: the proxy can be hosted openly — anyone who connects
+needs and spends only their own provider key.
 
 ## FlowDown (reference example)
 
@@ -28,8 +36,8 @@ endpoint. To use it with the cascade:
 1. Start the proxy: `ragfaith-proxy` (default `http://127.0.0.1:8787`).
 2. In FlowDown, add a custom OpenAI-compatible provider with:
    - Base URL: `http://127.0.0.1:8787/v1`
-   - API key: any non-empty placeholder (the proxy substitutes the real
-     upstream key from `SYNTHETIC_API_KEY` / `RFE_UPSTREAM_KEY`).
+   - API key: your real provider key (e.g. a synthetic key) — it is forwarded
+     upstream and reused for that session's judge calls.
 3. Chat as usual. When a reply misstates the retrieved sources, the next turn
    automatically carries a corrective nudge — or, in chain mode, the correction
    streams right after the flagged reply.
@@ -87,8 +95,6 @@ conversation and reconcile; do not invent corrections.
 | `RFE_PROXY_HOST` | `127.0.0.1` | Listen address |
 | `RFE_PROXY_PORT` | `8787` | Listen port |
 | `RFE_UPSTREAM_BASE` | `https://api.synthetic.new/v1` | Upstream OpenAI-compatible base |
-| `SYNTHETIC_API_KEY` | — | Upstream key (or `RFE_UPSTREAM_KEY`) |
-| `RFE_UPSTREAM_KEY` | — | Fallback upstream key |
 | `RFE_JUDGE_PROVIDER` | `synthetic` | `synthetic` or `openrouter` |
 | `RFE_SYNTHETIC_BASE` | upstream base | Judge base URL (synthetic) |
 | `RFE_SYNTHETIC_GLM_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Primary judge model |
@@ -96,7 +102,6 @@ conversation and reconcile; do not invent corrections.
 | `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter) |
 | `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
 | `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
-| `OPENROUTER_API_KEY` | — | Judge key (openrouter) |
 | `RFE_NUDGE_MODE` | `chain` | `chain` or `next` |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |

@@ -53,10 +53,8 @@ class Config:
     proxy_host: str = "127.0.0.1"
     proxy_port: int = 8787
     upstream_base: str = DEFAULT_UPSTREAM
-    upstream_key: str = ""
     judge_provider: str = "synthetic"
     judge_base: str = DEFAULT_UPSTREAM
-    judge_key: str = ""
     glm_model: str = "hf:zai-org/GLM-5.3-Flash"
     deepseek_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
     premise_cap: int = 24000
@@ -74,14 +72,12 @@ class Config:
         provider = env.get("RFE_JUDGE_PROVIDER", "synthetic")
         if provider == "openrouter":
             judge_base = env.get("RFE_OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-            judge_key = env.get("OPENROUTER_API_KEY", "")
             glm = env.get("RFE_OPENROUTER_GLM_MODEL", "z-ai/glm-5.3-flash")
             deepseek = env.get("RFE_OPENROUTER_DEEPSEEK_MODEL", "deepseek/deepseek-v4.1-flash")
         else:
             judge_base = env.get(
                 "RFE_SYNTHETIC_BASE", env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM)
             )
-            judge_key = env.get("SYNTHETIC_API_KEY", env.get("RFE_UPSTREAM_KEY", ""))
             glm = env.get("RFE_SYNTHETIC_GLM_MODEL", "hf:zai-org/GLM-5.3-Flash")
             deepseek = env.get("RFE_SYNTHETIC_DEEPSEEK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
         decorators = {"default": {}}
@@ -93,10 +89,8 @@ class Config:
             proxy_host=env.get("RFE_PROXY_HOST", "127.0.0.1"),
             proxy_port=int(env.get("RFE_PROXY_PORT", "8787")),
             upstream_base=env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM),
-            upstream_key=env.get("SYNTHETIC_API_KEY", env.get("RFE_UPSTREAM_KEY", "")),
             judge_provider=provider,
             judge_base=judge_base,
-            judge_key=judge_key,
             glm_model=glm,
             deepseek_model=deepseek,
             premise_cap=int(env.get("RFE_PREMISE_CAP", "24000")),
@@ -205,7 +199,9 @@ def inject_nudge(messages: list[dict], nudge: str) -> list[dict]:
     return msgs
 
 
-def upstream_request(cfg: Config, method: str, suffix: str, body: bytes | None = None):
+def upstream_request(
+    cfg: Config, method: str, suffix: str, body: bytes | None = None, auth: str = ""
+):
     parts = urllib.parse.urlsplit(cfg.upstream_base.rstrip("/") + "/")
     if parts.scheme == "https":
         conn_cls = http.client.HTTPSConnection
@@ -213,7 +209,8 @@ def upstream_request(cfg: Config, method: str, suffix: str, body: bytes | None =
         conn_cls = http.client.HTTPConnection
     conn = conn_cls(parts.hostname, parts.port, timeout=120)
     headers = {
-        "Authorization": f"Bearer {cfg.upstream_key}",
+        # client-auth-only: the proxy holds no key of its own
+        "Authorization": auth,
         "Accept-Encoding": "identity",  # body must stay parseable; never gzip upstream
         "Connection": "close",
     }
@@ -290,9 +287,12 @@ class Cascade:
             st["nudge"] = None
         return nudge
 
-    def judge(self, model: str) -> Judge:
+    def judge(self, model: str, token: str) -> Judge:
+        # judges are keyed by (model, client token): verdicts are the same for
+        # any caller, but each caller's judge authenticates with its own key
+        cache_key = f"{model}\x00{token}"
         with self._lock:
-            j = self._judges.get(model)
+            j = self._judges.get(cache_key)
             if j is None:
                 cache_path = None
                 if self.cfg.cache_dir:
@@ -301,14 +301,16 @@ class Cascade:
                 j = Judge(
                     model,
                     self.cfg.judge_base,
-                    self.cfg.judge_key,
+                    token,
                     cache_path=cache_path,
                     log=self.log,
                 )
-                self._judges[model] = j
+                self._judges[cache_key] = j
         return j
 
-    def evaluate(self, conv: str, judge_model: str, text: str) -> list[tuple[str, str]]:
+    def evaluate(
+        self, conv: str, judge_model: str, text: str, token: str = ""
+    ) -> list[tuple[str, str]]:
         """Return [(claim, verdict)] for claims not judged faithful. Fail-open:
         judge errors are logged and the claim is skipped, never blocks the stream."""
         claims = [t for *_, t in split_claims(text)] if text else []
@@ -317,7 +319,7 @@ class Cascade:
         premises = self.premises(conv)
         if not premises:
             return []
-        judge = self.judge(judge_model)
+        judge = self.judge(judge_model, token)
         flagged = []
         for claim in claims:
             try:
@@ -332,6 +334,11 @@ class Cascade:
 
 def _norm(path: str) -> str:
     return path.split("?", 1)[0].rstrip("/")
+
+
+def _bearer_token(auth: str) -> str:
+    """Raw token from an Authorization header value (judge sends its own Bearer prefix)."""
+    return auth.split(None, 1)[1] if auth.lower().startswith("bearer ") else auth
 
 
 def make_handler(cascade: Cascade):
@@ -349,7 +356,9 @@ def make_handler(cascade: Cascade):
                 self.send_error(404)
                 return
             try:
-                resp, conn = upstream_request(cfg, "GET", "/v1/models")
+                resp, conn = upstream_request(
+                    cfg, "GET", "/v1/models", auth=self.headers.get("Authorization", "")
+                )
                 raw = resp.read()
                 conn.close()
             except OSError as e:
@@ -388,6 +397,11 @@ def make_handler(cascade: Cascade):
                 self.send_error(400, "invalid JSON body")
                 return
             messages = payload.get("messages") or []
+            auth = self.headers.get("Authorization", "")
+            if not auth:
+                # client-auth-only: proxy cannot reach upstream or judge without it
+                self.send_error(401, "Authorization header required")
+                return
             conv = cascade.conv_key(self.headers, messages)
             deco = resolve_host(cfg, self.headers)
             mode = deco.get("nudge_mode", cfg.nudge_mode)
@@ -401,7 +415,9 @@ def make_handler(cascade: Cascade):
             judge_model = select_judge(payload.get("model", ""), cfg)
             upstream_body = json.dumps(payload).encode()
             try:
-                resp, conn = upstream_request(cfg, "POST", "/chat/completions", upstream_body)
+                resp, conn = upstream_request(
+                    cfg, "POST", "/chat/completions", upstream_body, auth=auth
+                )
             except OSError as e:
                 cascade.log({"kind": "upstream-error", "error": str(e)})
                 self.send_error(502, "upstream connect failed")
@@ -420,11 +436,11 @@ def make_handler(cascade: Cascade):
                     pass
                 return
             if payload.get("stream"):
-                self._stream(resp, conn, conv, payload, messages, judge_model, mode, template)
+                self._stream(resp, conn, conv, payload, messages, judge_model, mode, template, auth)
             else:
-                self._plain(resp, conn, conv, judge_model, mode)
+                self._plain(resp, conn, conv, judge_model, mode, auth)
 
-        def _plain(self, resp, conn, conv, judge_model, mode):
+        def _plain(self, resp, conn, conv, judge_model, mode, auth):
             raw = resp.read()
             conn.close()
             self.send_response(200)
@@ -445,7 +461,7 @@ def make_handler(cascade: Cascade):
                 finish = choice.get("finish_reason")
                 if text and finish == "stop":
                     cascade.record_reply(conv, message)
-                    flagged = cascade.evaluate(conv, judge_model, text)
+                    flagged = cascade.evaluate(conv, judge_model, text, _bearer_token(auth))
                     if flagged:
                         if mode == "chain":
                             cascade.log(
@@ -468,7 +484,7 @@ def make_handler(cascade: Cascade):
         def _template(self):
             return resolve_host(cfg, self.headers).get("template", cfg.nudge_template)
 
-        def _stream(self, resp, conn, conv, payload, messages, judge_model, mode, template):
+        def _stream(self, resp, conn, conv, payload, messages, judge_model, mode, template, auth):
             # send response head before reading any upstream body: first token
             # latency must never wait on the cascade
             self.send_response(200)
@@ -523,12 +539,14 @@ def make_handler(cascade: Cascade):
                     cascade.record_reply(conv, reply)
                 assistant_text = "".join(text_parts)
                 if not dead and assistant_text and finish == "stop":
-                    flagged = cascade.evaluate(conv, judge_model, assistant_text)
+                    flagged = cascade.evaluate(
+                        conv, judge_model, assistant_text, _bearer_token(auth)
+                    )
                     if flagged:
                         nudge = render_template(template, **_nudge_args(judge_model, flagged))
                         if mode == "chain":
                             try:
-                                self._chain(conv, payload, messages, assistant_text, nudge)
+                                self._chain(conv, payload, messages, assistant_text, nudge, auth)
                                 reason = "chained"
                             except OSError:
                                 dead = True
@@ -549,7 +567,7 @@ def make_handler(cascade: Cascade):
                     pass
             cascade.note_end(reason, conv)
 
-        def _chain(self, conv, payload, messages, assistant_text, nudge):
+        def _chain(self, conv, payload, messages, assistant_text, nudge, auth):
             """One internal continuation call with the aggregated nudge, streamed
             onto the same SSE stream (its own [DONE] swallowed)."""
             chained = dict(
@@ -562,7 +580,7 @@ def make_handler(cascade: Cascade):
                 stream=True,
             )
             chained_body = json.dumps(chained).encode()
-            resp, conn = upstream_request(cfg, "POST", "/chat/completions", chained_body)
+            resp, conn = upstream_request(cfg, "POST", "/chat/completions", chained_body, auth=auth)
             if resp.status != 200:
                 cascade.log({"kind": "chain-error", "status": resp.status, "conversation": conv})
                 resp.read()
