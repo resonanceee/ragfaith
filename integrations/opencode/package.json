@@ -1,6 +1,6 @@
 {
   "name": "@resonanceee/opencode-ragfaith",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "opencode plugin: live faithfulness cascade (ragfaith)",
   "type": "module",
   "main": "src/index.ts",
