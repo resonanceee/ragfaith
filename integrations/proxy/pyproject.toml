@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ragfaith-proxy"
-version = "0.1.8"
+version = "0.1.9"
 description = "Universal OpenAI-compatible sidecar proxy with a live ragfaith faithfulness cascade"
 requires-python = ">=3.11"
 dependencies = []

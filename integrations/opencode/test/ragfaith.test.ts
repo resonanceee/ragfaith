@@ -69,8 +69,8 @@ describe("claim segmentation", () => {
   test("empty/whitespace drops out", () => {
     expect(segmentClaims("   ").length).toBe(0);
   });
-
-  test("markdown furniture dropped, prose kept (issue 76)", () => {    const claims = segmentClaims(
+  test("markdown furniture dropped, prose kept (issue 76)", () => {
+    const claims = segmentClaims(
       [
         "Alzheon reported Phase 2 data in April 2025.",
         "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 — missed primary endpoint** overall, positive only in MCI subgroup ([Alzheon](https://example.com)) | The big catalyst already happened and was a miss; now in long-term extension.",
@@ -94,6 +94,127 @@ describe("claim segmentation", () => {
     );
     expect(claims.length).toBe(2);
     expect(claims[0]).toContain("ALZ-801 trial");
+  });
+
+  test("footnote / meta / confidence-interval (issue 76 reopened)", () => {
+    expect(segmentClaims('[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.')).toEqual(
+      [],
+    );
+    expect(segmentClaims("Overall confidence: High.")).toEqual([]);
+    expect(segmentClaims("certainty - medium")).toEqual([]);
+    expect(segmentClaims("tl;dr: everything above was wrong")).toEqual([]);
+    expect(segmentClaims("Spoiler: the butler did it")).toEqual([]);
+    expect(segmentClaims("The confidence interval was 95%.")).toEqual([
+      "The confidence interval was 95%.",
+    ]);
+  });
+
+  test("headings dropped, never fused with following text", () => {
+    expect(
+      segmentClaims(
+        "## The ticker and the options problem (read this first)\nActual prose follows here.",
+      ),
+    ).toEqual(["Actual prose follows here."]);
+    expect(
+      segmentClaims("## What it is\nFixed-dose combo of tenofovir and emtricitabine."),
+    ).toEqual(["Fixed-dose combo of tenofovir and emtricitabine."]);
+    expect(segmentClaims("#trending topic line here.")).toEqual(["#trending topic line here."]);
+  });
+
+  test("mega block never fuses (production Estelle case)", () => {
+    const claims = segmentClaims(
+      [
+        "Yo twin, here's the rundown on Estelle (born 1980 in Hammersmith, London):",
+        "",
+        "**Who she is**",
+        "- British singer blending R&B, soul and grime ([Wikipedia](https://example.com))",
+        "- Started out in London's Deal Real record store; John Legend became her mentor",
+        "- Debut album The 18th Day dropped in 2005",
+      ].join("\n"),
+    );
+    const markers = ["R&B", "John Legend", "18th Day"];
+    for (const c of claims) {
+      expect(markers.filter((m) => c.includes(m)).length).toBeLessThanOrEqual(1);
+      expect(c).not.toContain("**Who she is**");
+      expect(c.length).toBeLessThanOrEqual(300);
+    }
+    expect(claims.some((c) => c.startsWith("Yo twin"))).toBe(true);
+    expect(claims.some((c) => c.includes("Deal Real record store"))).toBe(true);
+    expect(claims.some((c) => c.startsWith("Debut album"))).toBe(true);
+  });
+
+  test("bold label dropped, bold-leading claim kept", () => {
+    expect(segmentClaims("**Who she is**")).toEqual([]);
+    expect(segmentClaims("*Summary*")).toEqual([]);
+    expect(segmentClaims("**Alzheon** reported Phase 2 data in April 2025.")).toEqual([
+      "**Alzheon** reported Phase 2 data in April 2025.",
+    ]);
+  });
+
+  test("overlong sentences resplit at clauses, unsplittable dropped", () => {
+    const src =
+      "The committee reviewed the full dossier over several weeks " +
+      "and interviewed witnesses ".repeat(8) +
+      "; then it voted to release the findings; and the chair signed the final report.";
+    const claims = segmentClaims(src);
+    expect(claims.length).toBeGreaterThan(1);
+    for (const c of claims) expect(c.length).toBeLessThanOrEqual(300);
+    expect(claims.some((c) => c.includes("voted to release"))).toBe(true);
+    expect(claims.some((c) => c.includes("signed the final report"))).toBe(true);
+    for (const c of claims) {
+      expect(c.includes("reviewed the full dossier") && c.includes("voted")).toBe(false);
+    }
+    expect(segmentClaims(("word ".repeat(120)).trim())).toEqual([]);
+  });
+
+  test("code fence / blockquote / numbered list / hr / bold-start", () => {
+    expect(segmentClaims("```python\nprint('hello world')\n```\nThe sky is blue.")).toEqual([
+      "The sky is blue.",
+    ]);
+    expect(segmentClaims("> The tower is in Paris.")).toEqual(["The tower is in Paris."]);
+    expect(segmentClaims("1. Cats cannot fly.\n2) Dogs bark.")).toEqual([
+      "Cats cannot fly.",
+      "Dogs bark.",
+    ]);
+    expect(
+      segmentClaims(["---", "***", "___", ":---", "***Bold emphasis opens a real claim about Paris."].join("\n")),
+    ).toEqual(["***Bold emphasis opens a real claim about Paris."]);
+  });
+
+  test("corpus invariants over production-shaped reply", () => {
+    const corpus = [
+      "## Quick takes",
+      "Here is the summary you asked for:",
+      "",
+      "| Ticker | Status |",
+      "|---|---|",
+      "| ALZH | missed endpoint |",
+      "[^1]: Source, title, 2026.",
+      "```",
+      "const x = 1;",
+      "```",
+      "**Who she is**",
+      "- Estelle was born in 1980 in Hammersmith, London.",
+      "- She blends R&B, soul, reggae, grime and dance.",
+      "Overall confidence: High.",
+      "Remternetug is currently in Phase 3 trials.",
+      "The committee reviewed the full dossier over several weeks " +
+        "and interviewed witnesses ".repeat(8) +
+        "; then it voted to release the findings.",
+    ].join("\n");
+    const claims = segmentClaims(corpus);
+    expect(claims.length).toBeGreaterThan(0);
+    for (const c of claims) {
+      expect(c.length).toBeLessThanOrEqual(300);
+      expect(c.trimStart().startsWith("|") || c.trimStart().startsWith("[^")).toBe(false);
+      expect(c).not.toContain("Overall confidence");
+      expect(c).not.toContain("const x");
+    }
+    expect(claims.some((c) => c.startsWith("Estelle was born in 1980"))).toBe(true);
+    expect(claims.some((c) => c.startsWith("She blends"))).toBe(true);
+    expect(claims.some((c) => c.includes("Remternetug"))).toBe(true);
+    expect(claims.some((c) => c.includes("voted to release"))).toBe(true);
+    expect(claims.every((c) => !c.includes("Ticker"))).toBe(true);
   });
 });
 
