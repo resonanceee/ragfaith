@@ -329,6 +329,167 @@ def test_split_claims_keeps_prose_containing_links():
     assert "ALZ-801 trial" in " ".join(texts)
 
 
+# ------------------------------------------- issue #76 reopened: full matrix
+
+from ragfaith_proxy.decompose import MAX_CLAIM_CHARS  # noqa: E402
+
+
+def _claims(src):
+    return [t for *_, t in split_claims(src)]
+
+
+def test_issue76_footnote_citation_dropped():
+    assert _claims('[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.') == []
+
+
+def test_issue76_meta_confidence_dropped():
+    assert _claims("Overall confidence: High.") == []
+    assert _claims("certainty - medium") == []
+    assert _claims("tl;dr: everything above was wrong") == []
+    assert _claims("Spoiler: the butler did it") == []
+
+
+def test_issue76_confidence_interval_is_a_claim():
+    src = "The confidence interval was 95%."
+    assert _claims(src) == [src]
+
+
+def test_issue76_table_rows_and_fragments_dropped():
+    src = "\n".join(
+        [
+            "^4] |",
+            "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 "
+            "— missed primary endpoint** overall, positive only in MCI subgroup "
+            "([Alzheon](https://example.com)) | The big catalyst already happened "
+            "and was a miss; now in long-term extension.",
+            "|---|---|---|",
+        ]
+    )
+    assert _claims(src) == []
+
+
+def test_issue76_heading_only_dropped():
+    src = "## The ticker and the options problem (read this first)\nActual prose follows here."
+    assert _claims(src) == ["Actual prose follows here."]
+
+
+def test_issue76_heading_not_fused_with_bullet():
+    src = "## What it is\nFixed-dose combo of tenofovir and emtricitabine."
+    assert _claims(src) == ["Fixed-dose combo of tenofovir and emtricitabine."]
+
+
+def test_issue76_hashtag_without_space_is_a_claim():
+    src = "#trending topic line here."
+    assert _claims(src) == [src]
+
+
+def test_issue76_mega_block_never_fuses():
+    # production case: intro + bold label + 3 bullets extracted as ONE claim.
+    # Degraded regex path may split at url dots, so assert invariants (each
+    # bullet's facts stay in their own claim), not exact counts.
+    src = "\n".join(
+        [
+            "Yo twin, here's the rundown on Estelle (born 1980 in Hammersmith, London):",
+            "",
+            "**Who she is**",
+            "- British singer blending R&B, soul and grime ([Wikipedia](https://example.com))",
+            "- Started out in London's Deal Real record store; John Legend became her mentor",
+            "- Debut album The 18th Day dropped in 2005",
+        ]
+    )
+    claims = _claims(src)
+    markers = ("R&B", "John Legend", "18th Day")
+    for c in claims:
+        hits = sum(1 for m in markers if m in c)
+        assert hits <= 1, f"bullets fused into one claim: {c!r}"
+        assert "**Who she is**" not in c, "bold label survived as claim"
+        assert len(c) <= MAX_CLAIM_CHARS
+    assert any(c.startswith("Yo twin") for c in claims)
+    assert any("Deal Real record store" in c for c in claims)
+    assert any(c.startswith("Debut album") for c in claims)
+
+
+def test_issue76_bold_label_dropped_bold_claim_kept():
+    assert _claims("**Who she is**") == []
+    assert _claims("*Summary*") == []
+    src = "**Alzheon** reported Phase 2 data in April 2025."
+    assert _claims(src) == [src]
+
+
+def test_issue76_overlong_sentence_resplit_at_clauses():
+    src = (
+        "The committee reviewed the full dossier over several weeks "
+        + "and interviewed witnesses " * 8
+        + "; then it voted to release the findings; and the chair signed the final report."
+    )
+    claims = _claims(src)
+    assert len(claims) > 1
+    assert all(len(c) <= MAX_CLAIM_CHARS for c in claims)
+    assert any("voted to release" in c for c in claims)
+    assert any("signed the final report" in c for c in claims)
+    assert all("reviewed the full dossier" not in c or "voted" not in c for c in claims)
+
+
+def test_issue76_overlong_unsplittable_dropped():
+    src = ("word " * 120).strip()  # 600 chars, no clause boundary
+    assert _claims(src) == []
+
+
+def test_issue76_code_fence_dropped():
+    src = "```python\nprint('hello world')\n```\nThe sky is blue."
+    assert _claims(src) == ["The sky is blue."]
+
+
+def test_issue76_blockquote_and_numbered_list_atomic():
+    assert _claims("> The tower is in Paris.") == ["The tower is in Paris."]
+    assert _claims("1. Cats cannot fly.\n2) Dogs bark.") == ["Cats cannot fly.", "Dogs bark."]
+
+
+def test_issue76_hr_variants_dropped_bold_start_kept():
+    src = "\n".join(
+        ["---", "***", "___", ":---", "***Bold emphasis opens a real claim about Paris."]
+    )
+    assert _claims(src) == ["***Bold emphasis opens a real claim about Paris."]
+
+
+def test_issue76_corpus_invariants():
+    # production-shaped reply mixing every garbage class: invariants must hold
+    corpus = "\n".join(
+        [
+            "## Quick takes",
+            "Here is the summary you asked for:",
+            "",
+            "| Ticker | Status |",
+            "|---|---|",
+            "| ALZH | missed endpoint |",
+            "[^1]: Source, title, 2026.",
+            "```",
+            "const x = 1;",
+            "```",
+            "**Who she is**",
+            "- Estelle was born in 1980 in Hammersmith, London.",
+            "- She blends R&B, soul, reggae, grime and dance.",
+            "Overall confidence: High.",
+            "Remternetug is currently in Phase 3 trials.",
+            "The committee reviewed the full dossier over several weeks "
+            + "and interviewed witnesses " * 8
+            + "; then it voted to release the findings.",
+        ]
+    )
+    claims = _claims(corpus)
+    assert claims, "corpus must produce claims"
+    for c in claims:
+        assert len(c) <= MAX_CLAIM_CHARS, f"mega-claim survived: {c[:80]!r}"
+        assert not c.lstrip().startswith(("|", "[^", "# ", "##")), f"furniture survived: {c[:80]!r}"
+        assert "Overall confidence" not in c
+        assert "const x" not in c
+    assert any(c.startswith("Estelle was born in 1980") for c in claims)
+    assert any(c.startswith("She blends") for c in claims)
+    assert any("Remternetug" in c for c in claims)
+    assert any("voted to release" in c for c in claims)
+    assert all("Ticker" not in c for c in claims)
+
+
 def test_inject_nudge_after_last_assistant():
     msgs = [
         {"role": "user", "content": "q"},

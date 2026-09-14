@@ -193,25 +193,86 @@ export function selectPremise(
 // claim segmentation
 // ---------------------------------------------------------------------------
 
-/** Markdown furniture: table rows/fragments, footnotes, thematic breaks,
- *  reference-style link definitions. Not atomic claims; judging them wastes
- *  tokens and produces false flags (issue #76). */
-const FURNITURE_RE = /^\s*(?:\||\[\^|\^\S|---|\[[^\]\n]*\]:\s*<?https?:\/\/)/;
+// Longest claim handed to the judge (nudge display truncates at 200; longer
+// blobs degrade judge JSON compliance and make nudges un-actionable).
+const MAX_CLAIM_CHARS = 300;
+
+// heading lines (## ... ) — labels, not assertions
+const HEADING_RE = /^\s*#{1,6}\s+\S/;
+
+// table rows/fragments, footnotes, reference-style link definitions
+const FURNITURE_RE = /^\s*(?:\||\[\^|\^\S|\[[^\]\n]*\]:\s*<?https?:\/\/)/;
+
+// thematic breaks: --- *** ___ :--- (must be the whole line)
+const HR_RE = /^\s*:?[*_-]{3,}:?\s*$/;
+
+// meta-confidence lines: "Overall confidence: High." / "tl;dr: ..." /
+// "spoiler: ..." — never assertions. Requires : or - right after the label
+// so "Confidence interval was 95%" survives.
+const META_RE =
+  /^\s*(?:tl\s*;\s*dr|spoiler(?:\s+alert)?|(?:overall\s+)?confidence|certainty)\s*[:\-]/i;
+
+// whole-line bold/italic labels: "**Who she is**" — sub-headers, not claims
+// (content after the label keeps the line as a claim candidate)
+const LABEL_RE = /^\s*\*{1,3}[^*\n]{1,60}\*{1,3}\s*[:.]?\s*$/;
+
+// list bullets / numbered markers: content becomes its own atomic candidate
+const LIST_RE = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/;
+
+// blockquote markers
+const QUOTE_RE = /^\s*>\s?/;
+
+// clause boundaries for over-long claims: after ; : — –
+const CLAUSE_RE = /(?<=[;:\u2014\u2013])\s+/;
+
+/** Markdown-structural pre-pass (issue #76): one candidate per source line
+ *  so whole blocks never fuse into mega-claims. */
+function claimSegments(text: string): string[] {
+  const segs: string[] = [];
+  let fence = false;
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue; // blank line = hard boundary; candidates never fuse
+    if (fence) {
+      if (s.startsWith("```") || s.startsWith("~~~")) fence = false;
+      continue; // code lines are not claims
+    }
+    if (s.startsWith("```") || s.startsWith("~~~")) {
+      fence = true;
+      continue;
+    }
+    if (HR_RE.test(s) || HEADING_RE.test(s) || FURNITURE_RE.test(s)) continue;
+    if (META_RE.test(s) || LABEL_RE.test(s)) continue;
+    let t = s.replace(LIST_RE, "");
+    t = t.replace(QUOTE_RE, "");
+    if (t) segs.push(t);
+  }
+  return segs;
+}
+
+/** Enforce MAX_CLAIM_CHARS: re-split at clause boundaries, drop remnants
+ *  that are still over-long (never pass a blob to the judge). */
+function claimTexts(sentence: string): string[] {
+  if (sentence.length <= MAX_CLAIM_CHARS) return [sentence];
+  return sentence
+    .split(CLAUSE_RE)
+    .map((p) => p.trim())
+    .filter((p) => p && p.length <= MAX_CLAIM_CHARS);
+}
 
 /** Split reply text into sentence-granularity claims via Intl.Segmenter.
- *  Markdown furniture lines are dropped before segmentation. */
+ *  Markdown furniture/labels/headings/code are never claims; list items and
+ *  blockquotes are atomic; no claim exceeds MAX_CLAIM_CHARS (issue #76). */
 export function segmentClaims(text: string): string[] {
   // sentence-boundary drift vs spaCy sentencizer; swap in a real
   // segmenter lib if parity matters
   const seg = new Intl.Segmenter(undefined, { granularity: "sentence" });
-  const filtered = text
-    .split("\n")
-    .filter((l) => !FURNITURE_RE.test(l))
-    .join("\n");
   const claims: string[] = [];
-  for (const s of seg.segment(filtered)) {
-    const t = s.segment.trim();
-    if (t) claims.push(t);
+  for (const cand of claimSegments(text)) {
+    for (const s of seg.segment(cand)) {
+      const t = s.segment.trim();
+      if (t) claims.push(...claimTexts(t));
+    }
   }
   return claims;
 }
