@@ -102,7 +102,22 @@ All-faithful replies are fully silent: no extra call, no injection.
 
 Judging parallelism: per-claim judge calls within one cascade run concurrently
 (`RFE_JUDGE_WORKERS`, default 8) — one judge round-trip per reply instead of
-one per claim.
+one per claim. 429/5xx judge errors are retried with backoff + jitter
+(4 attempts); claims that still fail are skipped fail-open and counted in the
+`judge-skipped` log line.
+
+Flag set: only `unfaithful` verdicts nudge by default — `unverifiable` marks
+derivation/drift, not fabrication. Set `RFE_FLAG_VERDICTS=unfaithful,unverifiable`
+(or a per-host `flag_verdicts` decorator) to surface drift too.
+
+Stream timing: in `chain` mode `[DONE]` is withheld until the cascade has
+ruled (the correction appends to the same stream). In `next` mode — and for
+faithful replies in any mode — the stream closes immediately after the
+upstream reply and the cascade runs in the background.
+
+Auditability: `RFE_JUDGE_LOG` rows include the claim text, verdict, verdict
+cache key, and conversation id; nudge stash/delivery events are logged
+(`nudge-stash` / `nudge-delivered`, nudge text truncated to 500 chars).
 
 Default nudge template:
 
@@ -132,7 +147,8 @@ conversation and reconcile; do not invent corrections.
 | `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
 | `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
 | `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
-| `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls |
+| `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls (lower this for rate-limited upstreams; 429/5xx are retried with backoff) |
+| `RFE_FLAG_VERDICTS` | `unfaithful` | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable` to also surface drift) |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |
 | `RFE_HOST_CONFIG` | — | Path to same JSON map in a file |

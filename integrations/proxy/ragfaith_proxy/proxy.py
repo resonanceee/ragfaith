@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .decompose import split_claims
-from .judge import Judge
+from .judge import VERDICTS, Judge
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,15 @@ JUDGE_STORE_MAX = 100
 
 # concurrent per-claim judge calls inside one cascade evaluation
 JUDGE_WORKERS = int(os.environ.get("RFE_JUDGE_WORKERS", "8"))
+
+
+def _parse_flag_verdicts(raw: str) -> tuple:
+    """CSV of verdicts that trigger a nudge. Default: unfaithful only —
+    'unverifiable' marks derivation/drift, not fabrication (issue #74)."""
+    items = tuple(v.strip() for v in raw.split(",") if v.strip() in VERDICTS)
+    return items or ("unfaithful",)
+
+
 MAX_BODY = int(os.environ.get("RFE_MAX_BODY", str(10 * 1024 * 1024)))
 
 
@@ -87,6 +96,7 @@ class Config:
     nudge_mode: str = "chain"
     nudge_template: str = DEFAULT_NUDGE
     regen_template: str = DEFAULT_REGEN_NUDGE
+    flag_verdicts: tuple = ("unfaithful",)
     cache_dir: str | None = None
     judge_log: str | None = None
     host_decorators: dict = field(default_factory=lambda: {"default": {}})
@@ -126,6 +136,7 @@ class Config:
             nudge_mode=env.get("RFE_NUDGE_MODE", "chain"),
             nudge_template=env.get("RFE_NUDGE_TEMPLATE", DEFAULT_NUDGE),
             regen_template=env.get("RFE_REGEN_NUDGE", DEFAULT_REGEN_NUDGE),
+            flag_verdicts=_parse_flag_verdicts(env.get("RFE_FLAG_VERDICTS", "unfaithful")),
             cache_dir=env.get("RFE_CACHE_DIR") or None,
             judge_log=env.get("RFE_JUDGE_LOG") or None,
             host_decorators=decorators,
@@ -376,15 +387,20 @@ class Cascade:
             messages = list(st["messages"]) if st is not None else []
         return harvest_premises(messages, self.cfg.premise_cap)
 
-    def set_nudge(self, conv: str, nudge: str) -> None:
+    def set_nudge(self, conv: str, nudge: str | None) -> None:
         with self._lock:
             self._state(conv)["nudge"] = nudge
+        if nudge is not None:
+            # audit trail: the nudge text carries the flagged claims verbatim
+            self.log({"kind": "nudge-stash", "conversation": conv, "nudge": nudge[:500]})
 
     def pop_nudge(self, conv: str) -> str | None:
         with self._lock:
             st = self._state(conv)
             nudge = st["nudge"]
             st["nudge"] = None
+        if nudge is not None:
+            self.log({"kind": "nudge-delivered", "conversation": conv, "nudge": nudge[:500]})
         return nudge
 
     def judge(self, model: str, token: str) -> Judge:
@@ -413,10 +429,16 @@ class Cascade:
         return j
 
     def evaluate(
-        self, conv: str, judge_model: str, text: str, token: str = ""
+        self,
+        conv: str,
+        judge_model: str,
+        text: str,
+        token: str = "",
+        flag_verdicts: tuple | None = None,
     ) -> list[tuple[str, str]]:
-        """Return [(claim, verdict)] for claims not judged faithful. Fail-open:
-        judge errors are logged and the claim is skipped, never blocks the stream."""
+        """Return [(claim, verdict)] for claims whose verdict is in the flag
+        set (default: unfaithful only). Fail-open: judge errors are logged and
+        the claim is skipped, never blocks the stream."""
         claims = [t for *_, t in split_claims(text)] if text else []
         if not claims:
             return []
@@ -424,6 +446,7 @@ class Cascade:
         if not premises:
             return []
         judge = self.judge(judge_model, token)
+        flag_set = flag_verdicts if flag_verdicts is not None else self.cfg.flag_verdicts
 
         def _verdict(claim: str):
             try:
@@ -436,7 +459,12 @@ class Cascade:
         # instead of one per claim); pool.map keeps result order stable
         with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
             results = list(pool.map(_verdict, claims))
-        return [(c, v) for c, v in results if v not in (None, "faithful")]
+        skipped = sum(1 for _, v in results if v is None)
+        if skipped:
+            self.log(
+                {"kind": "judge-skipped", "n": skipped, "total": len(results), "conversation": conv}
+            )
+        return [(c, v) for c, v in results if v in flag_set]
 
 
 def _norm(path: str) -> str:
@@ -567,6 +595,10 @@ def make_handler(cascade: Cascade):
             mode = deco.get("nudge_mode", cfg.nudge_mode)
             template = deco.get("template", cfg.nudge_template)
             regen_template = deco.get("regen_template", cfg.regen_template)
+            raw_flags = deco.get("flag_verdicts", cfg.flag_verdicts)
+            flag_set = (
+                _parse_flag_verdicts(raw_flags) if isinstance(raw_flags, str) else tuple(raw_flags)
+            )
             cascade.record_messages(conv, list(messages))
 
             pending = cascade.pop_nudge(conv)  # next-mode delivery
@@ -601,13 +633,17 @@ def make_handler(cascade: Cascade):
                     pass
                 return
             if mode == "regen":
-                self._regen(resp, conn, conv, payload, messages, judge_model, regen_template, auth)
+                self._regen(
+                    resp, conn, conv, payload, messages, judge_model, regen_template, auth, flag_set
+                )
             elif payload.get("stream"):
-                self._stream(resp, conn, conv, payload, messages, judge_model, mode, template, auth)
+                self._stream(
+                    resp, conn, conv, payload, messages, judge_model, mode, template, auth, flag_set
+                )
             else:
-                self._plain(resp, conn, conv, judge_model, mode, auth)
+                self._plain(resp, conn, conv, judge_model, mode, auth, flag_set)
 
-        def _plain(self, resp, conn, conv, judge_model, mode, auth):
+        def _plain(self, resp, conn, conv, judge_model, mode, auth, flag_set):
             raw = resp.read()
             conn.close()
             self.send_response(200)
@@ -628,7 +664,9 @@ def make_handler(cascade: Cascade):
                 finish = choice.get("finish_reason")
                 if text and finish == "stop":
                     cascade.record_reply(conv, message)
-                    flagged = cascade.evaluate(conv, judge_model, text, _bearer_token(auth))
+                    flagged = cascade.evaluate(
+                        conv, judge_model, text, _bearer_token(auth), flag_set
+                    )
                     if flagged:
                         if mode == "chain":
                             cascade.log(
@@ -651,7 +689,9 @@ def make_handler(cascade: Cascade):
         def _template(self):
             return resolve_host(cfg, self.headers).get("template", cfg.nudge_template)
 
-        def _stream(self, resp, conn, conv, payload, messages, judge_model, mode, template, auth):
+        def _stream(
+            self, resp, conn, conv, payload, messages, judge_model, mode, template, auth, flag_set
+        ):
             # send response head before reading any upstream body: first token
             # latency must never wait on the cascade
             self.send_response(200)
@@ -666,6 +706,11 @@ def make_handler(cascade: Cascade):
             held_done = False
             dead = False
             buf = b""
+            # only chain mode needs [DONE] withheld (it may append the
+            # self-correction to the same stream); every other mode flushes
+            # [DONE] immediately so the client's spinner stops on time, and
+            # the cascade runs in the background (issue #72)
+            hold_done = mode == "chain"
             try:
                 while True:
                     block = resp.read1(8192)
@@ -697,6 +742,28 @@ def make_handler(cascade: Cascade):
                 except OSError:
                     dead = True
 
+            if not hold_done and not dead:
+                # close the stream now; judge + stash in a background thread
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    dead = True
+                if not dead:
+                    self._cascade_bg(
+                        conv,
+                        payload,
+                        messages,
+                        judge_model,
+                        template,
+                        auth,
+                        flag_set,
+                        text_parts,
+                        tool_calls,
+                        finish,
+                    )
+                    return
+
             reason = "disconnected" if dead else "done"
             try:
                 if not dead and (text_parts or tool_calls):
@@ -707,7 +774,7 @@ def make_handler(cascade: Cascade):
                 assistant_text = "".join(text_parts)
                 if not dead and assistant_text and finish == "stop":
                     flagged = cascade.evaluate(
-                        conv, judge_model, assistant_text, _bearer_token(auth)
+                        conv, judge_model, assistant_text, _bearer_token(auth), flag_set
                     )
                     if flagged:
                         nudge = render_template(template, **_nudge_args(judge_model, flagged))
@@ -740,7 +807,51 @@ def make_handler(cascade: Cascade):
                     pass
             cascade.note_end(reason, conv)
 
-        def _regen(self, resp, conn, conv, payload, messages, judge_model, template, auth):
+        def _cascade_bg(
+            self,
+            conv,
+            payload,
+            messages,
+            judge_model,
+            template,
+            auth,
+            flag_set,
+            text_parts,
+            tool_calls,
+            finish,
+        ):
+            """Background cascade for stream-through modes (chain not held):
+            record the reply, judge, stash the nudge. Errors only log — the
+            client stream is already closed."""
+
+            def _run():
+                reason = "done"
+                try:
+                    if text_parts or tool_calls:
+                        reply = {"role": "assistant", "content": "".join(text_parts) or None}
+                        if tool_calls:
+                            reply["tool_calls"] = tool_calls
+                        cascade.record_reply(conv, reply)
+                    assistant_text = "".join(text_parts)
+                    if assistant_text and finish == "stop":
+                        flagged = cascade.evaluate(
+                            conv, judge_model, assistant_text, _bearer_token(auth), flag_set
+                        )
+                        if flagged:
+                            nudge = render_template(template, **_nudge_args(judge_model, flagged))
+                            cascade.set_nudge(conv, nudge)
+                            reason = "stashed"
+                        else:
+                            reason = "faithful"
+                except Exception as e:  # noqa: BLE001
+                    cascade.log({"kind": "cascade-error", "error": str(e), "conversation": conv})
+                cascade.note_end(reason, conv)
+
+            threading.Thread(target=_run, daemon=True, name="ragfaith-cascade").start()
+
+        def _regen(
+            self, resp, conn, conv, payload, messages, judge_model, template, auth, flag_set
+        ):
             """regen mode: buffer the whole upstream reply, judge in parallel,
             then show the client exactly one assistant response — the original
             when faithful, the regenerated one when flagged. The nudge itself
@@ -827,7 +938,9 @@ def make_handler(cascade: Cascade):
             seen = original
             regen_raw = b""
             try:
-                flagged = cascade.evaluate(conv, judge_model, assistant_text, _bearer_token(auth))
+                flagged = cascade.evaluate(
+                    conv, judge_model, assistant_text, _bearer_token(auth), flag_set
+                )
                 if flagged:
                     nudge = render_template(template, **_nudge_args(judge_model, flagged))
                     regen_payload = dict(
