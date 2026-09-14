@@ -58,7 +58,7 @@ pulled sources (async — replies are never blocked or delayed).
 ## 5. Watch it work
 
 ```sh
-export RFE_JUDGE_LOG=judge.jsonl   # token-only judge cost log
+export RFE_JUDGE_LOG=judge.jsonl   # token-only judge cost log (silent by default)
 opencode                            # start a session, check the file
 ```
 

@@ -21,6 +21,7 @@ import {
   redactSecrets,
   maxClaims,
   RagfaithPlugin,
+  logLine,
 } from "../src/index";
 
 const GLM = "test/glm-judge";
@@ -456,28 +457,33 @@ describe("doc-pull heuristic", () => {
 describe("hooks never throw", () => {
   let stderrLines: string[];
 
-  test("judge fetch rejects -> unverifiable, no exception, log emitted", async () => {
+  test("judge fetch rejects -> unverifiable, no exception; errors only when sink opted in", async () => {
     const origWrite = process.stderr.write.bind(process.stderr);
     stderrLines = [];
     (process.stderr as { write: unknown }).write = (chunk: unknown) => {
       stderrLines.push(String(chunk));
       return true;
     };
-    try {
-      const judge = new Judge({
+    const mk = (logFile?: string) =>
+      new Judge({
         baseUrl: "https://x.test",
         apiKey: "k",
         model: GLM,
         session: "s",
+        logFile,
         fetchImpl: (async () => {
           throw new Error("network down");
         }) as unknown as typeof fetch,
         sleepImpl: noSleep,
       });
-      const v = await judge.verdict("ctx", "claim");
+    try {
+      // default: silent — failing judge must not print to stderr
+      const silent = await mk(undefined).verdict("ctx", "claim");
+      expect(silent).toBe("unverifiable");
+      expect(stderrLines.length).toBe(0);
+      // explicit stderr sink: the error row is emitted
+      const v = await mk("stderr").verdict("ctx", "claim");
       expect(v).toBe("unverifiable");
-      expect(judge.callFailures).toBe(1);
-      expect(judge.parseErrors).toBe(0);
       const errLog = stderrLines.find((l) => l.includes('"kind":"error"'));
       expect(errLog).toBeDefined();
     } finally {
@@ -705,5 +711,48 @@ describe("plugin hooks", () => {
       delete process.env["SYNTHETIC_API_KEY"];
       delete process.env["RFE_MAX_CLAIMS"];
     }
+  });
+});
+
+// ---------------------------------------------------------------- logging sink
+
+describe("logging sink", () => {
+  const origWrite = process.stderr.write;
+
+  afterEach(() => {
+    process.stderr.write = origWrite;
+  });
+
+  function capture(): string[] {
+    const lines: string[] = [];
+    process.stderr.write = ((s: unknown) => {
+      lines.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    return lines;
+  }
+
+  test("default: silent — nothing on stderr without RFE_JUDGE_LOG", () => {
+    const lines = capture();
+    logLine({ kind: "judge", prompt_tokens: 1 }, undefined);
+    expect(lines.length).toBe(0);
+  });
+
+  test("RFE_JUDGE_LOG=stderr: explicit debug output on stderr", () => {
+    const lines = capture();
+    logLine({ kind: "judge" }, "stderr");
+    expect(lines.length).toBe(1);
+    expect(lines[0]!.startsWith("{")).toBe(true);
+  });
+
+  test("file path: JSONL appended, stderr untouched", () => {
+    const lines = capture();
+    const dir = mkdtempSync(join(tmpdir(), "rfe-log-"));
+    const file = join(dir, "judge.jsonl");
+    logLine({ kind: "judge" }, file);
+    logLine({ kind: "judge" }, file);
+    expect(lines.length).toBe(0);
+    expect(readFileSync(file, "utf8").trim().split("\n").length).toBe(2);
+    rmSync(dir, { recursive: true, force: true });
   });
 });
