@@ -294,6 +294,40 @@ def test_split_claims_regex_fallback():
         assert src[start:end] == text
 
 
+# real markdown traffic from issue #76 (FlowDown reply with tables + footnotes)
+_ISSUE_MARKDOWN = "\n".join(
+    [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 "
+        "— missed primary endpoint** overall, positive only in MCI subgroup "
+        "([Alzheon](https://example.com)) | The big catalyst already happened "
+        "and was a miss; now in long-term extension.",
+        "^4] |",
+        '[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.',
+        "|---|---|---|",
+        "[Alzheon]: https://example.com/apolloe4",
+        "Remternetug is currently in Phase 3.",
+        "---",
+    ]
+)
+
+
+def test_split_claims_drops_markdown_furniture():
+    texts = [t for *_, t in split_claims(_ISSUE_MARKDOWN)]
+    assert texts == [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "Remternetug is currently in Phase 3.",
+    ]
+
+
+def test_split_claims_keeps_prose_containing_links():
+    src = "The ALZ-801 trial ([Alzheon](https://example.com)) missed its endpoint."
+    texts = [t for *_, t in split_claims(src)]
+    assert texts
+    assert all("|" not in t and not t.startswith(("^", "[^")) for t in texts)
+    assert "ALZ-801 trial" in " ".join(texts)
+
+
 def test_inject_nudge_after_last_assistant():
     msgs = [
         {"role": "user", "content": "q"},

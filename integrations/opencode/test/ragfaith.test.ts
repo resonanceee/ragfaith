@@ -68,6 +68,33 @@ describe("claim segmentation", () => {
   test("empty/whitespace drops out", () => {
     expect(segmentClaims("   ").length).toBe(0);
   });
+
+  test("markdown furniture dropped, prose kept (issue 76)", () => {
+    const claims = segmentClaims(
+      [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 — missed primary endpoint** overall, positive only in MCI subgroup ([Alzheon](https://example.com)) | The big catalyst already happened and was a miss; now in long-term extension.",
+        "^4] |",
+        '[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.',
+        "|---|---|---|",
+        "[Alzheon]: https://example.com/apolloe4",
+        "Remternetug is currently in Phase 3.",
+        "---",
+      ].join("\n"),
+    );
+    expect(claims).toEqual([
+      "Alzheon reported Phase 2 data in April 2025.",
+      "Remternetug is currently in Phase 3.",
+    ]);
+  });
+
+  test("prose containing inline links kept", () => {
+    const claims = segmentClaims(
+      "The ALZ-801 trial ([Alzheon](https://example.com)) missed its endpoint. It is now in extension.",
+    );
+    expect(claims.length).toBe(2);
+    expect(claims[0]).toContain("ALZ-801 trial");
+  });
 });
 
 describe("judge selection", () => {
