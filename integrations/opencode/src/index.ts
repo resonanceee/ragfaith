@@ -132,13 +132,23 @@ export function maxClaims(
 // claim segmentation
 // ---------------------------------------------------------------------------
 
-/** Split reply text into sentence-granularity claims via Intl.Segmenter. */
+/** Markdown furniture: table rows/fragments, footnotes, thematic breaks,
+ *  reference-style link definitions. Not atomic claims; judging them wastes
+ *  tokens and produces false flags (issue #76). */
+const FURNITURE_RE = /^\s*(?:\||\[\^|\^\S|---|\[[^\]\n]*\]:\s*<?https?:\/\/)/;
+
+/** Split reply text into sentence-granularity claims via Intl.Segmenter.
+ *  Markdown furniture lines are dropped before segmentation. */
 export function segmentClaims(text: string): string[] {
   // sentence-boundary drift vs spaCy sentencizer; swap in a real
   // segmenter lib if parity matters
   const seg = new Intl.Segmenter(undefined, { granularity: "sentence" });
+  const filtered = text
+    .split("\n")
+    .filter((l) => !FURNITURE_RE.test(l))
+    .join("\n");
   const claims: string[] = [];
-  for (const s of seg.segment(text)) {
+  for (const s of seg.segment(filtered)) {
     const t = s.segment.trim();
     if (t) claims.push(t);
   }

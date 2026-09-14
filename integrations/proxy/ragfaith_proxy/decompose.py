@@ -15,6 +15,15 @@ _nlp = None
 
 _SENT_RE = re.compile(r"[^.!?\n]+(?:[.!?]+|\n+|$)")
 
+# Markdown furniture: table rows/fragments, footnotes, thematic breaks,
+# reference-style link definitions. These are not atomic claims; judging them
+# wastes tokens and produces false flags (issue #76).
+_FURNITURE_RE = re.compile(r"^\s*(?:\||\[\^|\^\S|---|\[[^\]\n]*\]:\s*<?https?://)")
+
+
+def _strip_furniture(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not _FURNITURE_RE.match(line))
+
 
 def _get_nlp():  # lazy: spacy is an optional extra, the proxy must not need it
     global _nlp
@@ -57,6 +66,9 @@ def _get_nlp():  # lazy: spacy is an optional extra, the proxy must not need it
 
 
 def split_claims(text: str) -> list[tuple[int, int, str]]:
-    """Return [(start, end, sentence)] with char offsets into text."""
-    doc = _get_nlp()(text)
+    """Return [(start, end, sentence)] with char offsets into the
+    furniture-stripped text (markdown tables/footnotes/citations are dropped
+    before segmentation and never become claims; issue #76)."""
+    stripped = _strip_furniture(text)
+    doc = _get_nlp()(stripped)
     return [(s.start_char, s.end_char, s.text) for s in doc.sents if s.text.strip()]
