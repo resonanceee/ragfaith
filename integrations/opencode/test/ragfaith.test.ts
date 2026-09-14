@@ -20,6 +20,7 @@ import {
   isSensitivePath,
   redactSecrets,
   maxClaims,
+  premiseCapFor,
   RagfaithPlugin,
   logLine,
 } from "../src/index";
@@ -69,8 +70,7 @@ describe("claim segmentation", () => {
     expect(segmentClaims("   ").length).toBe(0);
   });
 
-  test("markdown furniture dropped, prose kept (issue 76)", () => {
-    const claims = segmentClaims(
+  test("markdown furniture dropped, prose kept (issue 76)", () => {    const claims = segmentClaims(
       [
         "Alzheon reported Phase 2 data in April 2025.",
         "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 — missed primary endpoint** overall, positive only in MCI subgroup ([Alzheon](https://example.com)) | The big catalyst already happened and was a miss; now in long-term extension.",
@@ -449,6 +449,61 @@ describe("premise cap", () => {
     expect(p.length).toBe(24_000);
     expect(p.text.startsWith("A".repeat(4000 - 1))).toBe(true); // older tail kept
     expect(p.text.endsWith("B".repeat(20_000))).toBe(true); // newest kept
+  });
+
+  test("cap raised later -> previously truncated content still available", () => {
+    const p = new PremiseStore(10);
+    p.append("x".repeat(40));
+    expect(p.length).toBe(10);
+    p.cap = 1000; // dynamic provider context lookup can grow the cap
+    expect(p.text).toContain("x".repeat(40));
+  });
+});
+
+describe("premiseCapFor", () => {
+  const MODEL = "test/cap-model"; // unique per test: module-level cache
+
+  function modelsFetch(status: number, body: unknown): { fetch: typeof fetch; calls: () => number } {
+    let calls = 0;
+    const f = (async () => {
+      calls++;
+      return { ok: status >= 200 && status < 300, status, json: async () => body } as Response;
+    }) as unknown as typeof fetch;
+    return { fetch: f, calls: () => calls };
+  }
+
+  test("half the context window as chars (~4 chars/token)", async () => {
+    const { fetch, calls } = modelsFetch(200, {
+      data: [{ id: "z-ai/cap-model:free", context_length: 131072 }],
+    });
+    expect(await premiseCapFor(MODEL, "https://x.test/v1", "k", fetch)).toBe(131072 * 2);
+    expect(calls()).toBe(1);
+    // cached per model: no second fetch
+    expect(await premiseCapFor(MODEL, "https://x.test/v1", "k", fetch)).toBe(131072 * 2);
+    expect(calls()).toBe(1);
+  });
+
+  test("no context_length reported -> default 24000", async () => {
+    const { fetch } = modelsFetch(200, { data: [{ id: "other/model" }] });
+    expect(await premiseCapFor("test/cap-model-b", "https://x.test/v1", "k", fetch)).toBe(24_000);
+  });
+
+  test("provider unreachable -> default 24000", async () => {
+    const throwing = (async () => {
+      throw new Error("down");
+    }) as unknown as typeof fetch;
+    expect(await premiseCapFor("test/cap-model-c", "https://x.test/v1", "k", throwing)).toBe(24_000);
+  });
+
+  test("RFE_PREMISE_CAP wins, no fetch", async () => {
+    const { fetch, calls } = modelsFetch(200, { data: [] });
+    process.env["RFE_PREMISE_CAP"] = "500";
+    try {
+      expect(await premiseCapFor("test/cap-model-d", "https://x.test/v1", "k", fetch)).toBe(500);
+      expect(calls()).toBe(0);
+    } finally {
+      delete process.env["RFE_PREMISE_CAP"];
+    }
   });
 });
 

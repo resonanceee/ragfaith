@@ -53,6 +53,10 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"{}")
             return
+        models = self.server.state.get("models_data")
+        if models is not None:
+            self._send_json({"object": "list", "data": models})
+            return
         self._send_json({"object": "list", "data": [{"id": "fake-model"}]})
 
     def do_POST(self):

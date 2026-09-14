@@ -128,6 +128,47 @@ export function maxClaims(
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_CLAIMS;
 }
 
+const premiseCapCache = new Map<string, number>();
+
+/** Premise cap in chars: half the judge model's context window (~4 chars/token),
+ *  read once per judge model from {baseUrl}/models `context_length`; falls back
+ *  to DEFAULT_PREMISE_CAP when the provider doesn't report it or the lookup
+ *  fails. An explicit RFE_PREMISE_CAP always wins. */
+export async function premiseCapFor(
+  judgeModel: string,
+  baseUrl: string,
+  apiKey: string,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<number> {
+  const envCap = Number.parseInt(process.env["RFE_PREMISE_CAP"] ?? "", 10);
+  if (Number.isFinite(envCap) && envCap > 0) return envCap;
+  const key = normalizeModelId(judgeModel);
+  const cached = premiseCapCache.get(key);
+  if (cached !== undefined) return cached;
+  let cap = DEFAULT_PREMISE_CAP;
+  try {
+    const r = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (r.ok) {
+      const data = (await r.json()) as {
+        data?: Array<{ id?: string; context_length?: number }>;
+      };
+      for (const m of data.data ?? []) {
+        if (m.context_length && normalizeModelId(String(m.id ?? "")) === key) {
+          // half the window; ~4 chars per token
+          cap = Math.floor(m.context_length * 2);
+          break;
+        }
+      }
+    }
+  } catch {
+    // unreachable provider / no context_length: keep the default cap
+  }
+  premiseCapCache.set(key, cap);
+  return cap;
+}
+
 // ---------------------------------------------------------------------------
 // claim segmentation
 // ---------------------------------------------------------------------------
@@ -451,18 +492,22 @@ export class Judge {
 
 export class PremiseStore {
   private buf = "";
-  constructor(private readonly cap = DEFAULT_PREMISE_CAP) {}
+  constructor(public cap = DEFAULT_PREMISE_CAP) {}
 
   append(text: string): void {
-    this.buf = (this.buf + "\n" + text).slice(-this.cap);
+    // buf kept whole: the cap can grow (dynamic provider context lookup)
+    // after truncation would have dropped content irrecoverably
+    this.buf += "\n" + text;
   }
 
   get text(): string {
-    return this.buf;
+    return this.cap > 0 && this.buf.length > this.cap
+      ? this.buf.slice(-this.cap)
+      : this.buf;
   }
 
   get length(): number {
-    return this.buf.length;
+    return this.text.length;
   }
 }
 
@@ -611,6 +656,9 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         );
         return;
       }
+      // dynamic cap: half the judge model's context window; may widen above
+      st.premises.cap = await premiseCapFor(judgeModel, provider.baseUrl, provider.apiKey);
+      const wideContext = st.premises.text;
       const judge = new Judge({
         baseUrl: provider.baseUrl,
         apiKey: provider.apiKey,
@@ -635,7 +683,7 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
       }
       const flagged: FlaggedClaim[] = [];
       for (const claim of kept) {
-        const v = await judge.verdict(context, claim);
+        const v = await judge.verdict(wideContext, claim);
         if (v === "unfaithful" || v === "unverifiable") {
           flagged.push({ claim, verdict: v });
         }

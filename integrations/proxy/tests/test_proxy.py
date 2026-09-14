@@ -628,3 +628,53 @@ def test_judge_retry_budget_bounded(rig, monkeypatch):
         judge.verdict("ctx", "claim")
     assert len(rig.state["judge_calls"]) == judge_mod.RETRIES
     assert sum(sleeps) <= 15, "retry sleeps must stay bounded"
+
+
+# ---------------------------------------------------------------- dynamic premise cap
+
+
+def test_premise_cap_unset_is_dynamic():
+    assert Config.from_env({}).premise_cap is None
+
+
+def test_premise_cap_env_pins_static():
+    assert Config.from_env({"RFE_PREMISE_CAP": "100"}).premise_cap == 100
+
+
+def test_dynamic_premise_cap_from_provider(rig):
+    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 131072}]
+    # half the window, ~4 chars/token
+    assert rig.cascade._dynamic_premise_cap("test/glm-judge", "tok") == 131072 * 2
+
+
+def test_dynamic_premise_cap_fallback_no_context_length(rig):
+    # fake upstream serves {"id": "fake-model"} without context_length
+    assert rig.cascade._dynamic_premise_cap("unknown-model", "") == 24000
+
+
+def test_dynamic_premise_cap_fallback_upstream_error(rig):
+    rig.state["models_status"] = 500
+    try:
+        assert rig.cascade._dynamic_premise_cap("test/ds-judge", "") == 24000
+    finally:
+        rig.state["models_status"] = None
+
+
+def test_dynamic_premise_cap_cached_per_model(rig):
+    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 1000}]
+    with rig.state["lock"]:
+        n0 = len(rig.state["auths"])
+    rig.cascade._dynamic_premise_cap("test/glm-judge", "t")
+    with rig.state["lock"]:
+        n1 = len(rig.state["auths"])
+    rig.cascade._dynamic_premise_cap("test/glm-judge", "t")
+    with rig.state["lock"]:
+        n2 = len(rig.state["auths"])
+    assert n2 - n0 == n1 - n0 == 1  # second call served from cache
+
+
+def test_premises_uses_dynamic_cap(rig):
+    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 1000}]
+    rig.cascade.record_reply("conv-dyn", {"role": "tool", "content": "x" * 3000})
+    out = rig.cascade.premises("conv-dyn", judge_model="test/glm-judge", token="t")
+    assert len(out) == 2000  # cap = 1000 tokens * 2 = 2000 chars, most recent kept
