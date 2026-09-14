@@ -15,6 +15,7 @@ from conftest import DONE_LINE, chunk, full_msg, iter_sse_lines, post, raw_post,
 from ragfaith_proxy.decompose import split_claims
 from ragfaith_proxy.judge import Judge
 from ragfaith_proxy.proxy import (
+    Cascade,
     Config,
     apply_tool_deltas,
     harvest_premises,
@@ -630,51 +631,124 @@ def test_judge_retry_budget_bounded(rig, monkeypatch):
     assert sum(sleeps) <= 15, "retry sleeps must stay bounded"
 
 
-# ---------------------------------------------------------------- dynamic premise cap
+# ---------------------------------------------------------------- premise selection (issue #82)
+
+from ragfaith_proxy.proxy import select_premise  # noqa: E402
 
 
-def test_premise_cap_unset_is_dynamic():
-    assert Config.from_env({}).premise_cap is None
+def test_premise_cap_default_static():
+    # issue #82: 0.1.7's dynamic half-context cap sent 822k prompt tokens for
+    # one reply; default is back to a static 24k chars
+    assert Config.from_env({}).premise_cap == 24000
 
 
-def test_premise_cap_env_pins_static():
-    assert Config.from_env({"RFE_PREMISE_CAP": "100"}).premise_cap == 100
+def test_select_premise_short_blob_returned_whole():
+    src = "Alpha is A.\n\nBeta is B."
+    assert select_premise(src, "What is Alpha?") == src
 
 
-def test_dynamic_premise_cap_from_provider(rig):
-    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 131072}]
-    # half the window, ~4 chars/token
-    assert rig.cascade._dynamic_premise_cap("test/glm-judge", "tok") == 131072 * 2
+def test_select_premise_picks_relevant_within_budget():
+    passages = [
+        f"Filler document number {i} discusses unrelated matters. " + "y" * 700 for i in range(20)
+    ]
+    relevant = "Alpha concentration measured in serum samples was elevated."
+    passages[3] = relevant
+    src = "\n\n".join(passages)
+    out = select_premise(src, "Was the Alpha concentration elevated?")
+    assert relevant in out
+    assert "Filler document number 19" not in out
+    assert len(out) <= 12000
 
 
-def test_dynamic_premise_cap_fallback_no_context_length(rig):
-    # fake upstream serves {"id": "fake-model"} without context_length
-    assert rig.cascade._dynamic_premise_cap("unknown-model", "") == 24000
+def test_select_premise_oversized_relevant_passage_head_truncated():
+    passages = ["zz" * 50] + ["Alpha serum levels rose sharply. " + "q" * 20000]
+    src = "\n\n".join(passages)
+    out = select_premise(src, "Did Alpha serum levels rise?")
+    assert out.startswith("Alpha serum levels rose sharply.")
+    assert len(out) <= 12000
 
 
-def test_dynamic_premise_cap_fallback_upstream_error(rig):
-    rig.state["models_status"] = 500
+def test_select_premise_no_overlap_falls_back_to_recent():
+    src = "\n\n".join(f"{i:02d} " + "z" * 2000 for i in range(10))
+    out = select_premise(src, "Completely unrelated xylophone question?")
+    assert out == src[-4000:]
+
+
+def test_judge_receives_selected_premise_not_full_blob(rig):
+    # selection re-prioritizes within the 24k premise window: relevant chunk
+    # kept, filler dropped, judge sees <= budget chars
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["script"] = [{"stream": [chunk("Alpha serum rose.", finish="stop"), DONE_LINE]}]
+    passages = [f"Filler topic {i}. " + "y" * 900 for i in range(22)]
+    passages.insert(3, "Alpha serum levels were elevated in the study.")
+    _, resp = post(
+        rig,
+        {
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "what about alpha serum?"},
+                {"role": "tool", "content": "\n\n".join(passages)},
+            ],
+        },
+    )
+    resp.read()
+    assert wait_ends(rig.cascade, 1)
+    with rig.state["lock"]:
+        ctx = rig.state["judge_calls"][0]["messages"][-1]["content"]
+    assert "Alpha serum levels were elevated" in ctx
+    assert "Filler topic 21" not in ctx
+    assert len(ctx) < 12000 + 200
+
+
+def test_judge_row_carries_context_chars(rig):
+    import tempfile
+    from pathlib import Path
+
+    logfile = Path(tempfile.gettempdir()) / "rfe-context-chars-test.jsonl"
+    open(logfile, "w").close()
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            glm_model=rig.cfg.glm_model,
+            judge_log=str(logfile),
+        )
+    )
+    judge = cascade.judge(rig.cfg.glm_model, "tok")
+    rig.state["verdicts"] = ["unfaithful"]
+    assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unfaithful"
+    rows = [json.loads(x) for x in logfile.read_text().splitlines() if x.strip()]
+    judge_rows = [r for r in rows if r.get("kind") == "judge"]
+    assert judge_rows and all(isinstance(r.get("context_chars"), int) for r in judge_rows)
+    assert judge_rows[0]["context_chars"] == len("Cats cannot fly.")
+
+
+def test_parse_error_row_counts_retry_tokens(rig):
+    import tempfile
+    from pathlib import Path
+
+    logfile = Path(tempfile.gettempdir()) / "rfe-parse-error-test.jsonl"
+    open(logfile, "w").close()
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            glm_model=rig.cfg.glm_model,
+            judge_log=str(logfile),
+        )
+    )
+    judge = cascade.judge(rig.cfg.glm_model, "tok")
+    rig.state["judge_content"] = "not json at all"
     try:
-        assert rig.cascade._dynamic_premise_cap("test/ds-judge", "") == 24000
+        assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unverifiable"
     finally:
-        rig.state["models_status"] = None
-
-
-def test_dynamic_premise_cap_cached_per_model(rig):
-    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 1000}]
-    with rig.state["lock"]:
-        n0 = len(rig.state["auths"])
-    rig.cascade._dynamic_premise_cap("test/glm-judge", "t")
-    with rig.state["lock"]:
-        n1 = len(rig.state["auths"])
-    rig.cascade._dynamic_premise_cap("test/glm-judge", "t")
-    with rig.state["lock"]:
-        n2 = len(rig.state["auths"])
-    assert n2 - n0 == n1 - n0 == 1  # second call served from cache
-
-
-def test_premises_uses_dynamic_cap(rig):
-    rig.state["models_data"] = [{"id": "test/glm-judge", "context_length": 1000}]
-    rig.cascade.record_reply("conv-dyn", {"role": "tool", "content": "x" * 3000})
-    out = rig.cascade.premises("conv-dyn", judge_model="test/glm-judge", token="t")
-    assert len(out) == 2000  # cap = 1000 tokens * 2 = 2000 chars, most recent kept
+        rig.state["judge_content"] = None
+    rows = [json.loads(x) for x in logfile.read_text().splitlines() if x.strip()]
+    err = [r for r in rows if r.get("kind") == "judge-parse-error"]
+    assert err, "parse error row missing"
+    assert err[0]["retry_prompt_tokens"] > 0  # 2 attempts x 11 prompt tokens
+    assert err[0]["retry_completion_tokens"] > 0
+    assert err[0]["context_chars"] == len("Cats cannot fly.")

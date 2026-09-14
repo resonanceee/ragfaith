@@ -53,10 +53,6 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"{}")
             return
-        models = self.server.state.get("models_data")
-        if models is not None:
-            self._send_json({"object": "list", "data": models})
-            return
         self._send_json({"object": "list", "data": [{"id": "fake-model"}]})
 
     def do_POST(self):
@@ -89,7 +85,16 @@ class FakeHandler(BaseHTTPRequestHandler):
             return
         resp = {
             "choices": [
-                {"message": {"content": json.dumps({"verdict": verdict})}, "finish_reason": "stop"}
+                {
+                    "message": {
+                        "content": (
+                            state["judge_content"]
+                            if state.get("judge_content") is not None
+                            else json.dumps({"verdict": verdict})
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
             ],
             "usage": {"prompt_tokens": 11, "completion_tokens": 3},
         }
@@ -140,6 +145,7 @@ def rig(request):
         "delay": 0.0,
         "judge_delay": 0.0,
         "judge_429_left": 0,
+        "judge_content": None,
         "auths": [],
         "fail_status": None,
         "fail_from": None,

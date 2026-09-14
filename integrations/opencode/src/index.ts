@@ -128,45 +128,65 @@ export function maxClaims(
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_CLAIMS;
 }
 
-const premiseCapCache = new Map<string, number>();
+// ---------------------------------------------------------------------------
+// per-claim premise selection (issue #82)
+// ---------------------------------------------------------------------------
 
-/** Premise cap in chars: half the judge model's context window (~4 chars/token),
- *  read once per judge model from {baseUrl}/models `context_length`; falls back
- *  to DEFAULT_PREMISE_CAP when the provider doesn't report it or the lookup
- *  fails. An explicit RFE_PREMISE_CAP always wins. */
-export async function premiseCapFor(
-  judgeModel: string,
-  baseUrl: string,
-  apiKey: string,
-  fetchImpl: typeof fetch = globalThis.fetch,
-): Promise<number> {
-  const envCap = Number.parseInt(process.env["RFE_PREMISE_CAP"] ?? "", 10);
-  if (Number.isFinite(envCap) && envCap > 0) return envCap;
-  const key = normalizeModelId(judgeModel);
-  const cached = premiseCapCache.get(key);
-  if (cached !== undefined) return cached;
-  let cap = DEFAULT_PREMISE_CAP;
-  try {
-    const r = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/models`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (r.ok) {
-      const data = (await r.json()) as {
-        data?: Array<{ id?: string; context_length?: number }>;
-      };
-      for (const m of data.data ?? []) {
-        if (m.context_length && normalizeModelId(String(m.id ?? "")) === key) {
-          // half the window; ~4 chars per token
-          cap = Math.floor(m.context_length * 2);
-          break;
-        }
-      }
-    }
-  } catch {
-    // unreachable provider / no context_length: keep the default cap
+// English glue words excluded from premise/claim overlap scoring; content
+// words carry the signal (also covers DE/IT reasonably via unicode \p{L})
+const STOPWORDS = new Set(
+  ("the a an and or of to in on for with is are was were be been it this that " +
+    "these those as at by from not but if then than so such into over under " +
+    "about their its his her they them you your we our can could will would " +
+    "should may might must do does did done have has had what which who whom " +
+    "when where why how").split(" "),
+);
+
+const DEFAULT_PREMISE_BUDGET = 12_000;
+const DEFAULT_PREMISE_FALLBACK = 4_000;
+
+function claimTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of text.toLowerCase().matchAll(/[\p{L}\p{N}]{4,}/gu)) {
+    const t = w[0];
+    if (t && !STOPWORDS.has(t)) out.add(t);
   }
-  premiseCapCache.set(key, cap);
-  return cap;
+  return out;
+}
+
+/** Most relevant premise passages for one claim, within `budget` chars
+ *  (lexical overlap, no embeddings). Oversized relevant passages are
+ *  head-truncated to the remaining room; with no overlap at all, the most
+ *  recent `fallback` chars are sent so the judge can answer unverifiable. */
+export function selectPremise(
+  premises: string,
+  claim: string,
+  budget = DEFAULT_PREMISE_BUDGET,
+  fallback = DEFAULT_PREMISE_FALLBACK,
+): string {
+  if (premises.length <= budget) return premises;
+  const claimToks = claimTokens(claim);
+  if (claimToks.size === 0) return premises.slice(-fallback);
+  const passages = premises.split("\n\n");
+  const scored = passages.map((p, i) => {
+    const toks = claimTokens(p);
+    let score = 0;
+    for (const t of claimToks) if (toks.has(t)) score++;
+    return { score, i, p };
+  });
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  const picked: Array<{ i: number; text: string }> = [];
+  let used = 0;
+  for (const s of scored) {
+    if (s.score <= 0 || used >= budget) continue;
+    const room = budget - used;
+    const text = s.p.length <= room ? s.p : s.p.slice(0, room);
+    picked.push({ i: s.i, text });
+    used += text.length + 2;
+  }
+  if (picked.length === 0) return premises.slice(-fallback);
+  picked.sort((a, b) => a.i - b.i);
+  return picked.map((p) => p.text).join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +456,7 @@ export class Judge {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
-  private account(resp: ChatResp): void {
+  private account(resp: ChatResp, contextChars: number): void {
     const usage = resp.usage ?? {};
     logLine(
       {
@@ -446,6 +466,7 @@ export class Judge {
         model: this.checkpoint,
         prompt_tokens: usage.prompt_tokens ?? 0,
         completion_tokens: usage.completion_tokens ?? 0,
+        context_chars: contextChars,
       },
       this.o.logFile || undefined,
     );
@@ -460,9 +481,13 @@ export class Judge {
     const msg = `CONTEXT:\n${context}\n\nCLAIM:\n${claim}`;
     try {
       let parsed: Verdict | undefined;
+      let retryPrompt = 0;
+      let retryCompletion = 0;
       for (const maxTokens of [this.o.maxTokens, this.o.maxTokens * 2]) {
         const resp = await this.call(msg, maxTokens);
-        this.account(resp);
+        this.account(resp, context.length);
+        retryPrompt += resp.usage?.prompt_tokens ?? 0;
+        retryCompletion += resp.usage?.completion_tokens ?? 0;
         const content = resp.choices?.[0]?.message?.content ?? "";
         try {
           parsed = parseVerdict(content);
@@ -473,6 +498,19 @@ export class Judge {
       }
       if (parsed === undefined) {
         this.parseErrors += 1; // parse failure: conservative fallback, counted
+        logLine(
+          {
+            ts: new Date().toISOString(),
+            session: this.o.session,
+            kind: "judge-parse-error",
+            model: this.checkpoint,
+            claim,
+            context_chars: context.length,
+            retry_prompt_tokens: retryPrompt,
+            retry_completion_tokens: retryCompletion,
+          },
+          this.o.logFile || undefined,
+        );
       } else {
         verdict = parsed;
       }
@@ -492,22 +530,18 @@ export class Judge {
 
 export class PremiseStore {
   private buf = "";
-  constructor(public cap = DEFAULT_PREMISE_CAP) {}
+  constructor(private readonly cap = DEFAULT_PREMISE_CAP) {}
 
   append(text: string): void {
-    // buf kept whole: the cap can grow (dynamic provider context lookup)
-    // after truncation would have dropped content irrecoverably
-    this.buf += "\n" + text;
+    this.buf = (this.buf + "\n" + text).slice(-this.cap);
   }
 
   get text(): string {
-    return this.cap > 0 && this.buf.length > this.cap
-      ? this.buf.slice(-this.cap)
-      : this.buf;
+    return this.buf;
   }
 
   get length(): number {
-    return this.text.length;
+    return this.buf.length;
   }
 }
 
@@ -656,9 +690,6 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         );
         return;
       }
-      // dynamic cap: half the judge model's context window; may widen above
-      st.premises.cap = await premiseCapFor(judgeModel, provider.baseUrl, provider.apiKey);
-      const wideContext = st.premises.text;
       const judge = new Judge({
         baseUrl: provider.baseUrl,
         apiKey: provider.apiKey,
@@ -683,7 +714,7 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
       }
       const flagged: FlaggedClaim[] = [];
       for (const claim of kept) {
-        const v = await judge.verdict(wideContext, claim);
+        const v = await judge.verdict(selectPremise(context, claim), claim);
         if (v === "unfaithful" || v === "unverifiable") {
           flagged.push({ claim, verdict: v });
         }
