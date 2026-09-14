@@ -8,6 +8,7 @@ lines instead of USD accounting.
 import hashlib
 import json
 import logging
+import random
 import re
 import sys
 import threading
@@ -21,16 +22,20 @@ logger = logging.getLogger(__name__)
 
 VERDICTS = ("faithful", "unfaithful", "unverifiable")
 VCACHE_MAX = 10000
-RETRIES = 3  # streaming handler must not stall minutes on an upstream outage
+RETRIES = 4  # bounded; 429/5xx backoff under ~30s total, streaming must not stall
 
 SYSTEM_PROMPT = (
     "You are a RAG faithfulness judge. / Du bist ein RAG-Treuerichter.\n"
     "Decide if the CLAIM is fully supported by the CONTEXT alone (never use "
     "outside knowledge). Answer with ONLY one JSON object, no other text:\n"
-    '{"verdict": "faithful"} - every fact in the claim is supported by the context\n'
-    '{"verdict": "unfaithful"} - at least one fact contradicts or is unsupported '
-    "by the context (wrong entity, number, date, or fabricated detail)\n"
-    '{"verdict": "unverifiable"} - the context does not address the claim at all'
+    '{"verdict": "faithful"} - every fact in the claim is directly supported '
+    "by the context\n"
+    '{"verdict": "unfaithful"} - the claim contradicts the context, or asserts '
+    "a specific fact (entity, number, date, event) that is absent from every "
+    "source in the context (fabricated detail)\n"
+    '{"verdict": "unverifiable"} - the context does not address the claim, '
+    "including claims that merely extrapolate, derive, compute, or hedge "
+    "beyond the sources without contradicting them"
 )
 
 
@@ -103,7 +108,9 @@ class Judge:
                     return json.loads(resp.read())
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 502, 503) and attempt < retries - 1:
-                    time.sleep(2**attempt)
+                    # rate limits fire exactly under parallel fan-out; add
+                    # jitter so concurrent claims don't retry in lockstep
+                    time.sleep(min(30, 2**attempt) + random.random())
                     continue
                 raise
             except (urllib.error.URLError, TimeoutError) as e:
@@ -115,7 +122,7 @@ class Judge:
                 raise
         raise RuntimeError("unreachable: retry loop exhausted")
 
-    def _account(self, resp: dict, conversation: str) -> None:
+    def _account(self, resp: dict, conversation: str, claim: str, verdict: str, key: str) -> None:
         usage = resp.get("usage") or {}
         self._log(
             {
@@ -124,6 +131,9 @@ class Judge:
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "conversation": conversation,
+                "claim": claim,
+                "verdict": verdict,
+                "key": key,
             }
         )
 
@@ -134,19 +144,29 @@ class Judge:
                 self._vcache.move_to_end(key)
                 return self._vcache[key]
         msg = f"CONTEXT:\n{context}\n\nCLAIM:\n{claim}"
+        resp = {}
         for max_tokens in (self.max_tokens, self.max_tokens * 2):
             resp = self._call(msg, max_tokens=max_tokens)
-            self._account(resp, conversation)
             content = resp["choices"][0]["message"].get("content")
             try:
                 verdict = _parse_verdict(content or "")
-                self._store(key, verdict)
-                return verdict
             except ValueError:
                 continue
-        verdict = "unverifiable"  # parse failure after 256 -> 2x tokens: conservative
-        self._store(key, verdict)
-        return verdict
+            self._account(resp, conversation, claim, verdict, key)
+            self._store(key, verdict)
+            return verdict
+        # parse failure after 256 -> 2x tokens: conservative fallback
+        self._account(resp, conversation, claim, "unverifiable", key)
+        self._log(
+            {
+                "kind": "judge-parse-error",
+                "model": self.model,
+                "conversation": conversation,
+                "claim": claim,
+            }
+        )
+        self._store(key, "unverifiable")
+        return "unverifiable"
 
     def _store(self, key: str, verdict: str) -> None:
         with self._lock:
