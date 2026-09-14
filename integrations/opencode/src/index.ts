@@ -262,11 +262,15 @@ export function makeCacheRegistry(
 // logging: token lines only, never USD
 // ---------------------------------------------------------------------------
 
-function logLine(obj: Record<string, unknown>, logFile?: string): void {
+export function logLine(obj: Record<string, unknown>, logFile?: string): void {
+  // silent by default: opencode surfaces plugin stderr in the TUI, and raw
+  // JSONL rows are noise for users. Opt in via RFE_JUDGE_LOG=<path> for a
+  // file, or RFE_JUDGE_LOG=stderr for explicit debug output.
+  if (!logFile) return;
   const line = JSON.stringify(obj) + "\n";
   try {
-    if (logFile) appendFileSync(logFile, line);
-    else process.stderr.write(line);
+    if (logFile === "stderr") process.stderr.write(line);
+    else appendFileSync(logFile, line);
   } catch {
     /* logging must never throw */
   }

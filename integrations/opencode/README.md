@@ -96,7 +96,8 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    `<RFE_CACHE_DIR>/opencode-cache-<model>.jsonl`; otherwise memory-only. One
    cache per judge model is loaded once per plugin lifetime (repeated replies
    reuse it). Every judge API call emits a token log line (tokens only, no USD)
-   to stderr or `RFE_JUDGE_LOG`.
+   to `RFE_JUDGE_LOG` — silent by default (`stderr` value for explicit debug;
+   unset would otherwise leak raw JSONL into the TUI).
 
 ## Privacy — what leaves the machine
 
@@ -134,7 +135,7 @@ agent reads.
 | `RFE_PREMISE_CAP`              | `24000`                              | max chars kept in premise buffer (most recent) |
 | `RFE_MAX_CLAIMS`               | `50`                                 | max claims judged per reply (rest skipped + logged) |
 | `RFE_CACHE_DIR`                | unset (memory-only)                  | persistent verdict cache directory |
-| `RFE_JUDGE_LOG`                | unset (stderr)                       | file for judge token/error log lines |
+| `RFE_JUDGE_LOG`                | unset (silent)                       | log sink: file path, or `stderr` for debug |
 
 Precedence: generic `RFE_JUDGE_*` vars → provider-specific vars → preset
 defaults. Example — judge with any OpenAI-compatible endpoint:
