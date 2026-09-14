@@ -32,7 +32,6 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.request
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -68,6 +67,21 @@ SSE_DONE = object()
 # per-conversation store bounded so long sessions can't grow memory without limit
 CONV_MESSAGE_CAP = 128
 DEFAULT_PREMISE_CAP = 24000
+
+# per-claim premise budget: relevant passages only (issue #82 - one shared
+# 24k+ blob per claim cost 822k prompt tokens and 177s judging for one reply)
+PREMISE_BUDGET = 12000
+PREMISE_FALLBACK = 4000
+
+# English glue words excluded from premise/claim overlap scoring; content
+# words carry the signal (also covers DE/IT reasonably via \w unicode)
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for with is are was were be been it this that "
+    "these those as at by from not but if then than so such into over under "
+    "about their its his her they them you your we our can could will would "
+    "should may might must do does did done have has had what which who whom "
+    "when where why how".split()
+)
 CONV_STORE_MAX = 1000
 JUDGE_STORE_MAX = 100
 
@@ -94,9 +108,9 @@ class Config:
     judge_base: str = DEFAULT_UPSTREAM
     glm_model: str = "hf:zai-org/GLM-5.3-Flash"
     deepseek_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
-    # char cap on judge-prompt premises. None = dynamic: half the judge
-    # model's context window via provider /models; RFE_PREMISE_CAP pins it.
-    premise_cap: int | None = None
+    # char cap on judge-prompt premises (most recent kept). Static only: the
+    # 0.1.7 dynamic half-context-window default regressed badly (issue #82).
+    premise_cap: int = DEFAULT_PREMISE_CAP
     nudge_mode: str = "chain"
     nudge_template: str = DEFAULT_NUDGE
     regen_template: str = DEFAULT_REGEN_NUDGE
@@ -136,7 +150,7 @@ class Config:
             judge_base=judge_base,
             glm_model=glm,
             deepseek_model=deepseek,
-            premise_cap=(int(raw) if (raw := env.get("RFE_PREMISE_CAP")) else None),
+            premise_cap=int(env.get("RFE_PREMISE_CAP", str(DEFAULT_PREMISE_CAP))),
             nudge_mode=env.get("RFE_NUDGE_MODE", "chain"),
             nudge_template=env.get("RFE_NUDGE_TEMPLATE", DEFAULT_NUDGE),
             regen_template=env.get("RFE_REGEN_NUDGE", DEFAULT_REGEN_NUDGE),
@@ -300,6 +314,38 @@ def upstream_request(
     return conn.getresponse(), conn
 
 
+def select_premise(
+    premises: str, claim: str, budget: int = PREMISE_BUDGET, fallback: int = PREMISE_FALLBACK
+) -> str:
+    """Most relevant premise passages for one claim, within `budget` chars
+    (lexical overlap, no embeddings). Oversized relevant passages are
+    head-truncated to the remaining room; with no overlap at all, the most
+    recent `fallback` chars are sent so the judge can answer unverifiable."""
+    if len(premises) <= budget:
+        return premises
+    claim_toks = {w for w in re.findall(r"\w{4,}", claim.lower()) if w not in _STOPWORDS}
+    if not claim_toks:
+        return premises[-fallback:]
+    scored = []
+    for i, p in enumerate(premises.split("\n\n")):
+        toks = {w for w in re.findall(r"\w{4,}", p.lower()) if w not in _STOPWORDS}
+        scored.append((len(claim_toks & toks), i, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    picked: list[tuple[int, str]] = []
+    used = 0
+    for score, i, p in scored:
+        if score <= 0 or used >= budget:
+            continue
+        room = budget - used
+        chunk = p if len(p) <= room else p[:room]
+        picked.append((i, chunk))
+        used += len(chunk) + 2
+    if not picked:
+        return premises[-fallback:]
+    picked.sort(key=lambda t: t[0])
+    return "\n\n".join(chunk for _, chunk in picked)
+
+
 class Cascade:
     """Thread-safe cascade state: judges, verdict cache wiring, conversation store."""
 
@@ -308,7 +354,6 @@ class Cascade:
         self._lock = threading.Lock()
         self._judges: OrderedDict[str, Judge] = OrderedDict()
         self._conv: OrderedDict[str, dict] = OrderedDict()
-        self._ctx_caps: dict[str, int] = {}
         self._end_count = 0
         self.events: list[dict] = []
         self._log_fh = open(cfg.judge_log, "a", encoding="utf-8") if cfg.judge_log else None
@@ -384,47 +429,13 @@ class Cascade:
             st = self._state(conv)
             st["messages"] = (st["messages"] + [dict(message)])[-CONV_MESSAGE_CAP:]
 
-    def premises(self, conv: str, judge_model: str = "", token: str = "") -> str:
+    def premises(self, conv: str) -> str:
         with self._lock:
             st = self._conv.get(conv)
             if st is not None:
                 self._conv.move_to_end(conv)
             messages = list(st["messages"]) if st is not None else []
-        cap = self.cfg.premise_cap
-        if cap is None:
-            cap = self._dynamic_premise_cap(judge_model, token)
-        return harvest_premises(messages, cap)
-
-    def _dynamic_premise_cap(self, judge_model: str, token: str) -> int:
-        """Half the judge model's context window, in chars (~4 chars/token),
-        read once per judge model from {judge_base}/models `context_length`.
-        Falls back to DEFAULT_PREMISE_CAP when the provider doesn't report it
-        or the lookup fails."""
-        if not judge_model:
-            return DEFAULT_PREMISE_CAP
-        key = _bare_model_id(judge_model)
-        with self._lock:
-            cached = self._ctx_caps.get(key)
-        if cached is not None:
-            return cached
-        cap = DEFAULT_PREMISE_CAP
-        try:
-            req = urllib.request.Request(
-                f"{self.cfg.judge_base.rstrip('/')}/models",
-                headers={"Authorization": f"Bearer {token}"} if token else {},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.load(resp)
-            for m in data.get("data", []):
-                if m.get("context_length") and _bare_model_id(str(m.get("id", ""))) == key:
-                    # half the window; ~4 chars per token
-                    cap = int(m["context_length"]) * 2
-                    break
-        except Exception as e:  # noqa: BLE001 - cap lookup must never break judging
-            self.log({"kind": "premise-cap-fallback", "error": str(e)})
-        with self._lock:
-            self._ctx_caps[key] = cap
-        return cap
+        return harvest_premises(messages, self.cfg.premise_cap)
 
     def set_nudge(self, conv: str, nudge: str | None) -> None:
         with self._lock:
@@ -481,7 +492,7 @@ class Cascade:
         claims = [t for *_, t in split_claims(text)] if text else []
         if not claims:
             return []
-        premises = self.premises(conv, judge_model=judge_model, token=token)
+        premises = self.premises(conv)
         if not premises:
             return []
         judge = self.judge(judge_model, token)
@@ -489,7 +500,8 @@ class Cascade:
 
         def _verdict(claim: str):
             try:
-                return claim, judge.verdict(premises, claim, conversation=conv)
+                context = select_premise(premises, claim)
+                return claim, judge.verdict(context, claim, conversation=conv)
             except Exception as e:  # noqa: BLE001 - cascade must never break passthrough
                 self.log({"kind": "judge-error", "error": str(e), "conversation": conv})
                 return claim, None

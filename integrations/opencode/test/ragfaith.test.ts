@@ -20,7 +20,7 @@ import {
   isSensitivePath,
   redactSecrets,
   maxClaims,
-  premiseCapFor,
+  selectPremise,
   RagfaithPlugin,
   logLine,
 } from "../src/index";
@@ -227,6 +227,42 @@ describe("verdict parsing", () => {
     expect(judge.parseErrors).toBe(1);
     expect(judge.callFailures).toBe(0);
     expect(calls).toBe(2); // retry once with 2x max_tokens on parse failure
+  });
+});
+
+describe("judge audit rows (issue 82)", () => {
+  test("parse-error row carries context_chars + retry tokens; judge rows too", async () => {
+    const lines: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      const judge = new Judge({
+        baseUrl: "https://x.test",
+        apiKey: "k",
+        model: GLM,
+        session: "s",
+        logFile: "stderr",
+        fetchImpl: (async () => ({
+          ok: true,
+          status: 200,
+          json: async () => okResp("nonsense"),
+        })) as unknown as typeof fetch,
+        sleepImpl: noSleep,
+      });
+      const ctx = "Cats cannot fly.";
+      expect(await judge.verdict(ctx, "Cats can fly.")).toBe("unverifiable");
+      const errRow = JSON.parse(lines.find((l) => l.includes('"judge-parse-error"'))!);
+      expect(errRow.context_chars).toBe(ctx.length);
+      expect(errRow.retry_prompt_tokens).toBeGreaterThan(0); // 2 attempts x 10
+      expect(errRow.retry_completion_tokens).toBeGreaterThan(0); // 2 attempts x 5
+      const judgeRow = JSON.parse(lines.find((l) => l.includes('"kind":"judge"'))!);
+      expect(judgeRow.context_chars).toBe(ctx.length);
+    } finally {
+      process.stderr.write = origWrite;
+    }
   });
 });
 
@@ -450,60 +486,41 @@ describe("premise cap", () => {
     expect(p.text.startsWith("A".repeat(4000 - 1))).toBe(true); // older tail kept
     expect(p.text.endsWith("B".repeat(20_000))).toBe(true); // newest kept
   });
-
-  test("cap raised later -> previously truncated content still available", () => {
-    const p = new PremiseStore(10);
-    p.append("x".repeat(40));
-    expect(p.length).toBe(10);
-    p.cap = 1000; // dynamic provider context lookup can grow the cap
-    expect(p.text).toContain("x".repeat(40));
-  });
 });
 
-describe("premiseCapFor", () => {
-  const MODEL = "test/cap-model"; // unique per test: module-level cache
-
-  function modelsFetch(status: number, body: unknown): { fetch: typeof fetch; calls: () => number } {
-    let calls = 0;
-    const f = (async () => {
-      calls++;
-      return { ok: status >= 200 && status < 300, status, json: async () => body } as Response;
-    }) as unknown as typeof fetch;
-    return { fetch: f, calls: () => calls };
-  }
-
-  test("half the context window as chars (~4 chars/token)", async () => {
-    const { fetch, calls } = modelsFetch(200, {
-      data: [{ id: "z-ai/cap-model:free", context_length: 131072 }],
-    });
-    expect(await premiseCapFor(MODEL, "https://x.test/v1", "k", fetch)).toBe(131072 * 2);
-    expect(calls()).toBe(1);
-    // cached per model: no second fetch
-    expect(await premiseCapFor(MODEL, "https://x.test/v1", "k", fetch)).toBe(131072 * 2);
-    expect(calls()).toBe(1);
+describe("premise selection (issue 82)", () => {
+  test("short blob returned whole", () => {
+    const src = "Alpha is A.\n\nBeta is B.";
+    expect(selectPremise(src, "What is Alpha?")).toBe(src);
   });
 
-  test("no context_length reported -> default 24000", async () => {
-    const { fetch } = modelsFetch(200, { data: [{ id: "other/model" }] });
-    expect(await premiseCapFor("test/cap-model-b", "https://x.test/v1", "k", fetch)).toBe(24_000);
+  test("relevant passage kept, filler dropped, within budget", () => {
+    const passages = Array.from(
+      { length: 20 },
+      (_, i) => `Filler document number ${i} discusses unrelated matters. ${"y".repeat(700)}`,
+    );
+    const relevant = "Alpha concentration measured in serum samples was elevated.";
+    passages[3] = relevant;
+    const src = passages.join("\n\n");
+    const out = selectPremise(src, "Was the Alpha concentration elevated?");
+    expect(out).toContain(relevant);
+    expect(out).not.toContain("Filler document number 19");
+    expect(out.length).toBeLessThanOrEqual(12_000);
   });
 
-  test("provider unreachable -> default 24000", async () => {
-    const throwing = (async () => {
-      throw new Error("down");
-    }) as unknown as typeof fetch;
-    expect(await premiseCapFor("test/cap-model-c", "https://x.test/v1", "k", throwing)).toBe(24_000);
+  test("oversized relevant passage head-truncated", () => {
+    const src = ["zz".repeat(50), `Alpha serum levels rose sharply. ${"q".repeat(20000)}`].join(
+      "\n\n",
+    );
+    const out = selectPremise(src, "Did Alpha serum levels rise?");
+    expect(out.startsWith("Alpha serum levels rose sharply.")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(12_000);
   });
 
-  test("RFE_PREMISE_CAP wins, no fetch", async () => {
-    const { fetch, calls } = modelsFetch(200, { data: [] });
-    process.env["RFE_PREMISE_CAP"] = "500";
-    try {
-      expect(await premiseCapFor("test/cap-model-d", "https://x.test/v1", "k", fetch)).toBe(500);
-      expect(calls()).toBe(0);
-    } finally {
-      delete process.env["RFE_PREMISE_CAP"];
-    }
+  test("no overlap falls back to most recent chars", () => {
+    const src = Array.from({ length: 10 }, (_, i) => `${String(i).padStart(2, "0")} ${"z".repeat(2000)}`).join("\n\n");
+    const out = selectPremise(src, "Completely unrelated xylophone question?");
+    expect(out).toBe(src.slice(-4000));
   });
 });
 

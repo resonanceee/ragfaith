@@ -122,7 +122,15 @@ class Judge:
                 raise
         raise RuntimeError("unreachable: retry loop exhausted")
 
-    def _account(self, resp: dict, conversation: str, claim: str, verdict: str, key: str) -> None:
+    def _account(
+        self,
+        resp: dict,
+        conversation: str,
+        claim: str,
+        verdict: str,
+        key: str,
+        context_chars: int = 0,
+    ) -> None:
         usage = resp.get("usage") or {}
         self._log(
             {
@@ -130,6 +138,7 @@ class Judge:
                 "model": self.model,
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
+                "context_chars": context_chars,
                 "conversation": conversation,
                 "claim": claim,
                 "verdict": verdict,
@@ -145,24 +154,31 @@ class Judge:
                 return self._vcache[key]
         msg = f"CONTEXT:\n{context}\n\nCLAIM:\n{claim}"
         resp = {}
+        retry_prompt = retry_completion = 0
         for max_tokens in (self.max_tokens, self.max_tokens * 2):
             resp = self._call(msg, max_tokens=max_tokens)
+            usage = resp.get("usage") or {}
+            retry_prompt += usage.get("prompt_tokens", 0)
+            retry_completion += usage.get("completion_tokens", 0)
             content = resp["choices"][0]["message"].get("content")
             try:
                 verdict = _parse_verdict(content or "")
             except ValueError:
                 continue
-            self._account(resp, conversation, claim, verdict, key)
+            self._account(resp, conversation, claim, verdict, key, len(context))
             self._store(key, verdict)
             return verdict
         # parse failure after 256 -> 2x tokens: conservative fallback
-        self._account(resp, conversation, claim, "unverifiable", key)
+        self._account(resp, conversation, claim, "unverifiable", key, len(context))
         self._log(
             {
                 "kind": "judge-parse-error",
                 "model": self.model,
                 "conversation": conversation,
                 "claim": claim,
+                "context_chars": len(context),
+                "retry_prompt_tokens": retry_prompt,
+                "retry_completion_tokens": retry_completion,
             }
         )
         self._store(key, "unverifiable")
