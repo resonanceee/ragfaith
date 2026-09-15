@@ -139,7 +139,13 @@ def test_build_nudge_strict_verdict_arms():
 
 
 def test_build_nudge_strict_unverifiable_only():
-    n = build_nudge(DEFAULT_NUDGE, DEFAULT_UNVERIFIABLE_NUDGE, True, "jm", [("Cats purr.", "unverifiable")])
+    n = build_nudge(
+        DEFAULT_NUDGE,
+        DEFAULT_UNVERIFIABLE_NUDGE,
+        True,
+        "jm",
+        [("Cats purr.", "unverifiable")],
+    )
     assert "reconcile" not in n
     assert "No silent assertions" in n
 
