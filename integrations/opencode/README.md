@@ -77,10 +77,15 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    claims via `Intl.Segmenter` and each claim is judged against session
    premises, capped at `RFE_MAX_CLAIMS` per reply (default 50; skipped count is
    logged). Everything is async fire-and-forget; the reply is never blocked.
-6. **Verdicts** — `faithful` passes silently. Any `unfaithful`/`unverifiable`
-   claims are aggregated into ONE nudge, injected as a follow-up user message
+6. **Verdicts** — `faithful` passes silently. Default flag set is `unfaithful`
+   only; `RFE_STRICTNESS=strict` adds `unverifiable` (explicit
+   `RFE_FLAG_VERDICTS` CSV wins). Flagged claims are aggregated into ONE nudge,
+   injected as a follow-up user message
    (`client.session.prompt`, `noReply: true`, `synthetic: true` so it never
-   auto-triggers a new turn and can't loop). If injection fails, falls back to
+   auto-triggers a new turn and can't loop). In strict mode the nudge gains a
+   provenance arm: each unverifiable claim must gain a cited source or an
+   explicit disclosure (internal knowledge / context inference). If injection
+   fails, falls back to
    a `tui.toast.show` warning plus a structured log line. Claims are never
    auto-corrected.
 7. **Judge call** — port of `rag_faithfulness_eval/llm_judge.py`:

@@ -9,6 +9,7 @@ import {
   resolveProvider,
   parseVerdict,
   buildNudge,
+  flagVerdicts,
   PremiseStore,
   Judge,
   makeCache,
@@ -657,6 +658,36 @@ describe("nudge aggregation", () => {
     expect(nudge).toContain("unverifiable (1)");
     expect(nudge).toContain("do not invent corrections");
     expect((nudge.match(/ragfaith judge/g) ?? []).length).toBe(1);
+  });
+
+  test("unverifiable claim adds provenance arm (issue #86)", () => {
+    const nudge = buildNudge(GLM, [{ claim: "Moon is cheese.", verdict: "unverifiable" }]);
+    expect(nudge).toContain("internal (training) knowledge");
+    expect(nudge).toContain("No silent assertions");
+  });
+
+  test("unfaithful-only nudge has no provenance arm", () => {
+    const nudge = buildNudge(GLM, [{ claim: "Sky is green.", verdict: "unfaithful" }]);
+    expect(nudge).not.toContain("internal (training) knowledge");
+  });
+});
+
+describe("flag verdicts (issue #86)", () => {
+  test("default fires on unfaithful only", () => {
+    expect(flagVerdicts({})).toEqual(["unfaithful"]);
+  });
+
+  test("RFE_STRICTNESS=strict adds unverifiable", () => {
+    expect(flagVerdicts({ RFE_STRICTNESS: "strict" })).toEqual([
+      "unfaithful",
+      "unverifiable",
+    ]);
+  });
+
+  test("explicit RFE_FLAG_VERDICTS wins over the preset", () => {
+    expect(
+      flagVerdicts({ RFE_STRICTNESS: "strict", RFE_FLAG_VERDICTS: "unfaithful" }),
+    ).toEqual(["unfaithful"]);
   });
 });
 

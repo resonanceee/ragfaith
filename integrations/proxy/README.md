@@ -107,8 +107,14 @@ one per claim. 429/5xx judge errors are retried with backoff + jitter
 `judge-skipped` log line.
 
 Flag set: only `unfaithful` verdicts nudge by default — `unverifiable` marks
-derivation/drift, not fabrication. Set `RFE_FLAG_VERDICTS=unfaithful,unverifiable`
-(or a per-host `flag_verdicts` decorator) to surface drift too.
+derivation/drift, not fabrication. Set `RFE_STRICTNESS=strict` to fire on both
+verdicts with verdict-aware nudge arms (unfaithful → reconciliation text;
+unverifiable → each claim must gain a cited source or an explicit
+provenance disclosure: internal knowledge or context inference), or set
+`RFE_FLAG_VERDICTS=unfaithful,unverifiable` (or a per-host `flag_verdicts`
+decorator) to surface drift with the normal template. When premises exceed the
+per-claim budget, the judge is told to prefer `unverifiable` over `unfaithful`
+so premise filtering/truncation can't read as fabrication.
 
 Stream timing: in `chain` mode `[DONE]` is withheld until the cascade has
 ruled (the correction appends to the same stream). In `next` mode — and for
@@ -118,6 +124,12 @@ upstream reply and the cascade runs in the background.
 Auditability: `RFE_JUDGE_LOG` rows include the claim text, verdict, verdict
 cache key, and conversation id; nudge stash/delivery events are logged
 (`nudge-stash` / `nudge-delivered`, nudge text truncated to 500 chars).
+Client-visible failures are logged too (issue #85): every relayed non-200
+(`passthrough-status` with a redacted body excerpt), every proxy-side request
+rejection (`request-rejected`: `invalid-json`, `bad-messages`, `bad-model`,
+`missing-auth`, `bad-content-length`, `payload-too-large`), and the nudge
+next-mode path (`nudge-inject` payload size, `nudge-request-failed` upstream
+status when a nudged request fails).
 
 Default nudge template:
 
@@ -148,7 +160,9 @@ conversation and reconcile; do not invent corrections.
 | `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
 | `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
 | `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls (lower this for rate-limited upstreams; 429/5xx are retried with backoff) |
-| `RFE_FLAG_VERDICTS` | `unfaithful` | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable` to also surface drift) |
+| `RFE_FLAG_VERDICTS` | `unfaithful` | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable` to also surface drift); wins over the strictness preset |
+| `RFE_STRICTNESS` | `normal` | `normal` = flag `unfaithful` only; `strict` = flag both verdicts + verdict-aware nudge arms |
+| `RFE_NUDGE_TEMPLATE_UNVERIFIABLE` | provenance template | Strict-mode nudge arm for `unverifiable` claims (per-host key: `unverifiable_template`) |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |
 | `RFE_HOST_CONFIG` | — | Path to same JSON map in a file |
