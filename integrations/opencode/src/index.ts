@@ -128,6 +128,24 @@ export function maxClaims(
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_CLAIMS;
 }
 
+/** Verdicts that trigger a nudge (issue #86): normal = unfaithful only;
+ *  RFE_STRICTNESS=strict adds unverifiable; explicit RFE_FLAG_VERDICTS wins. */
+export function flagVerdicts(
+  env: Record<string, string | undefined> = process.env,
+): Verdict[] {
+  const csv = env["RFE_FLAG_VERDICTS"];
+  if (csv) {
+    const items = csv
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v): v is Verdict => (VERDICTS as readonly string[]).includes(v));
+    if (items.length) return items;
+  }
+  return env["RFE_STRICTNESS"] === "strict"
+    ? ["unfaithful", "unverifiable"]
+    : ["unfaithful"];
+}
+
 // ---------------------------------------------------------------------------
 // per-claim premise selection (issue #82)
 // ---------------------------------------------------------------------------
@@ -144,6 +162,13 @@ const STOPWORDS = new Set(
 
 const DEFAULT_PREMISE_BUDGET = 12_000;
 const DEFAULT_PREMISE_FALLBACK = 4_000;
+
+// conservative label under premise filtering (issue #86): support missing only
+// because of truncation must not read as fabrication
+export const TRUNCATION_NOTE =
+  "\n\n[NOTE: this context is a relevance-filtered excerpt of the pulled " +
+  'sources; if the claim\'s support is missing only because of that filtering ' +
+  'or truncation, answer "unverifiable", not "unfaithful".]';
 
 function claimTokens(text: string): Set<string> {
   const out = new Set<string>();
@@ -669,12 +694,22 @@ export function buildNudge(judgeModel: string, flagged: FlaggedClaim[]): string 
   const claims = flagged
     .map((f, i) => `${i + 1}. [${f.verdict}] ${f.claim.slice(0, 200)}`)
     .join("\n");
-  return (
+  let out =
     `ragfaith judge (${judgeModel}): ${flagged.length} claim(s) in your last ` +
     `reply were flagged ${verdicts}.\nClaims:\n${claims}\n` +
     "Re-check against the sources actually pulled in this session and " +
-    "reconcile; do not invent corrections."
-  );
+    "reconcile; do not invent corrections.";
+  if (counts.has("unverifiable")) {
+    // strict arm (issue #86): an unverifiable claim is unattributed, not wrong
+    out +=
+      "\n\nUnverifiable claims are not in the pulled sources; resolve each " +
+      "visibly in your next reply in exactly one of these ways: (1) back it " +
+      "with further searches or fetches and cite the newly pulled source; " +
+      "(2) openly disclose that it comes from your internal (training) " +
+      "knowledge, not the pulled sources; (3) openly disclose that it was " +
+      "inferred from data inside the context. No silent assertions.";
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -773,10 +808,18 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           logFile,
         );
       }
+      const allowed = flagVerdicts();
       const flagged: FlaggedClaim[] = [];
       for (const claim of kept) {
-        const v = await judge.verdict(selectPremise(context, claim), claim);
-        if (v === "unfaithful" || v === "unverifiable") {
+        const sel = selectPremise(context, claim);
+        // premise filtering dropped content: prefer the conservative label so
+        // truncation can't read as fabrication (issue #86)
+        const ctx =
+          context.length > DEFAULT_PREMISE_BUDGET
+            ? sel + TRUNCATION_NOTE
+            : sel;
+        const v = await judge.verdict(ctx, claim);
+        if (v !== "faithful" && allowed.includes(v)) {
           flagged.push({ claim, verdict: v });
         }
         // faithful: silent pass, no annotation
