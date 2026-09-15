@@ -34,9 +34,7 @@ def _rows():
 def test_passthrough_4xx_logged(rig):
     open(LOGFILE, "w").close()
     rig.state["fail_status"] = 400
-    _, resp = post(
-        rig, {"model": "m", "messages": TOOL_EXCHANGE}, {"X-Conversation-Id": "pt"}
-    )
+    _, resp = post(rig, {"model": "m", "messages": TOOL_EXCHANGE}, {"X-Conversation-Id": "pt"})
     assert resp.status == 400
     resp.read()
     rows = _rows()

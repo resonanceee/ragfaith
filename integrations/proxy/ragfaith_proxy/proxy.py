@@ -76,7 +76,7 @@ DEFAULT_UNVERIFIABLE_NUDGE = (
 # because of truncation must not read as fabrication
 _TRUNCATION_NOTE = (
     "\n\n[NOTE: this context is a relevance-filtered excerpt of the pulled "
-    'sources; if the claim\'s support is missing only because of that filtering '
+    "sources; if the claim's support is missing only because of that filtering "
     'or truncation, answer "unverifiable", not "unfaithful".]'
 )
 SSE_DONE = object()
@@ -810,7 +810,10 @@ def make_handler(cascade: Cascade):
                         cascade.set_nudge(
                             conv,
                             build_nudge(
-                                self._template, self._uv_template, self._strict, judge_model,
+                                self._template,
+                                self._uv_template,
+                                self._strict,
+                                judge_model,
                                 flagged,
                             ),
                         )
