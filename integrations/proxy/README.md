@@ -29,8 +29,12 @@ Tests (no network): `pip install .[dev] && pytest -q`
 The proxy holds **no API key of its own**. Every client request must carry its
 own `Authorization: Bearer <provider key>` header, which the proxy forwards to
 the upstream verbatim. The client's token also authenticates the judge calls
-that request's cascade triggers. Requests without an `Authorization` header
-get 401. Consequence: the proxy can be hosted openly — anyone who connects
+that request's cascade triggers — with one exception: the client's upstream
+credential is only valid for judging when the judge provider is the same as
+the upstream, so with the `openrouter` judge preset the judge authenticates
+with the `OPENROUTER_API_KEY` environment variable instead (falling back to
+the client token only if it is unset). Requests without an `Authorization`
+header get 401. Consequence: the proxy can be hosted openly — anyone who connects
 needs and spends only their own provider key.
 
 ## FlowDown (reference example)
@@ -62,11 +66,12 @@ client -> proxy -> upstream LLM
 
 - **Model detection**: the request's `model` field is the active model.
 - **Judge selection** (never self-judge): the active model is compared against
-  the configured GLM judge model (provider prefixes and `:` variants ignored).
-  A match is judged by the configured DeepSeek model; anything else is judged
-  by the configured GLM model. Both models are configurable for any
-  OpenAI-compatible endpoint via `RFE_JUDGE_GLM_MODEL` /
-  `RFE_JUDGE_DEEPSEEK_MODEL` — no `hf:`-style id shape required.
+  the configured main judge model (provider prefixes and `:` variants ignored;
+  an exact match or the main judge id appearing inside the active id counts
+  as a match). A match is judged by the configured fallback model; anything
+  else is judged by the main model. Both models are configurable for any
+  OpenAI-compatible endpoint via `RFE_JUDGE_MAIN_MODEL` /
+  `RFE_JUDGE_FALLBACK_MODEL` — no `hf:`-style id shape required.
 - **Premises**: content the conversation actually pulled — `role: "tool"`
   messages and `tool_result` content blocks, capped to the most recent
   24k chars (`RFE_PREMISE_CAP`). A small per-conversation store covers clients
@@ -107,17 +112,30 @@ one per claim. 429/5xx judge errors are retried with backoff + jitter
 `judge-skipped` log line.
 
 Flag set: only `unfaithful` verdicts nudge by default — `unverifiable` marks
-derivation/drift, not fabrication. Set `RFE_FLAG_VERDICTS=unfaithful,unverifiable`
-(or a per-host `flag_verdicts` decorator) to surface drift too.
+derivation/drift, not fabrication. Set `RFE_STRICTNESS=strict` to fire on both
+verdicts with verdict-aware nudge arms (unfaithful → reconciliation text;
+unverifiable → each claim must gain a cited source or an explicit
+provenance disclosure: internal knowledge or context inference), or set
+`RFE_FLAG_VERDICTS=unfaithful,unverifiable` (or a per-host `flag_verdicts`
+decorator) to surface drift with the normal template. When premises exceed the
+per-claim budget, the judge is told to prefer `unverifiable` over `unfaithful`
+so premise filtering/truncation can't read as fabrication.
 
-Stream timing: in `chain` mode `[DONE]` is withheld until the cascade has
-ruled (the correction appends to the same stream). In `next` mode — and for
-faithful replies in any mode — the stream closes immediately after the
-upstream reply and the cascade runs in the background.
+Stream timing: only `chain` mode needs `[DONE]` withheld (it may append the
+self-correction to the same stream), so the client waits for the cascade to
+rule before the stream closes — faithful or not. Every other mode flushes
+`[DONE]` immediately after the upstream reply so the spinner stops on time,
+and the cascade runs in the background.
 
 Auditability: `RFE_JUDGE_LOG` rows include the claim text, verdict, verdict
 cache key, and conversation id; nudge stash/delivery events are logged
 (`nudge-stash` / `nudge-delivered`, nudge text truncated to 500 chars).
+Client-visible failures are logged too (issue #85): every relayed non-200
+(`passthrough-status` with a redacted body excerpt), every proxy-side request
+rejection (`request-rejected`: `invalid-json`, `bad-messages`, `bad-model`,
+`missing-auth`, `bad-content-length`, `payload-too-large`), and the nudge
+next-mode path (`nudge-inject` payload size, `nudge-request-failed` upstream
+status when a nudged request fails).
 
 Default nudge template:
 
@@ -136,19 +154,22 @@ conversation and reconcile; do not invent corrections.
 | `RFE_UPSTREAM_BASE` | `https://api.synthetic.new/v1` | Upstream OpenAI-compatible base |
 | `RFE_JUDGE_PROVIDER` | `synthetic` | Preset: `synthetic` or `openrouter` (free-form with generic vars) |
 | `RFE_JUDGE_BASE` | preset | Generic judge base URL; overrides preset |
-| `RFE_JUDGE_GLM_MODEL` | preset | Generic primary judge model; overrides preset |
-| `RFE_JUDGE_DEEPSEEK_MODEL` | preset | Generic GLM-active judge model; overrides preset |
+| `RFE_JUDGE_MAIN_MODEL` | preset | Generic main judge model; overrides preset (e.g. `inclusionai/ling-3.0-flash` on OpenRouter — fastest/cheapest judge, but highest parse-error rate; GLM default stays accuracy-first) |
+| `RFE_JUDGE_FALLBACK_MODEL` | preset | Generic fallback judge model; overrides preset |
 | `RFE_SYNTHETIC_BASE` | upstream base | Judge base URL (synthetic preset) |
-| `RFE_SYNTHETIC_GLM_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Primary judge model (synthetic preset) |
-| `RFE_SYNTHETIC_DEEPSEEK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when active model is GLM (synthetic preset) |
+| `RFE_SYNTHETIC_MAIN_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Main judge model (synthetic preset) |
+| `RFE_SYNTHETIC_FALLBACK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when the main judge is the active model (synthetic preset) |
 | `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter preset) |
-| `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
-| `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
+| `RFE_OPENROUTER_MAIN_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter main judge |
+| `RFE_OPENROUTER_FALLBACK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter fallback judge |
+| `OPENROUTER_API_KEY` | — | Judge auth when `RFE_JUDGE_PROVIDER=openrouter` (client token is upstream-only; used as fallback if unset) |
 | `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
 | `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
 | `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
 | `RFE_JUDGE_WORKERS` | `8` | Concurrent per-claim judge calls (lower this for rate-limited upstreams; 429/5xx are retried with backoff) |
-| `RFE_FLAG_VERDICTS` | `unfaithful` | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable` to also surface drift) |
+| `RFE_FLAG_VERDICTS` | `unfaithful` | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable` to also surface drift); wins over the strictness preset |
+| `RFE_STRICTNESS` | `normal` | `normal` = flag `unfaithful` only; `strict` = flag both verdicts + verdict-aware nudge arms |
+| `RFE_NUDGE_TEMPLATE_UNVERIFIABLE` | provenance template | Strict-mode nudge arm for `unverifiable` claims (per-host key: `unverifiable_template`) |
 | `RFE_PREMISE_CAP` | `24000` | Max chars of premises per verdict |
 | `RFE_HOST_DECORATORS` | — | JSON map of per-host overrides |
 | `RFE_HOST_CONFIG` | — | Path to same JSON map in a file |
@@ -163,8 +184,8 @@ Example — judge with any OpenAI-compatible endpoint:
 ```sh
 export RFE_JUDGE_PROVIDER=my-endpoint        # preset name is free-form
 export RFE_JUDGE_BASE=http://llm.internal/v1
-export RFE_JUDGE_GLM_MODEL=openai/gpt-oss-120b
-export RFE_JUDGE_DEEPSEEK_MODEL=mistral/magistral-small
+export RFE_JUDGE_MAIN_MODEL=openai/gpt-oss-120b
+export RFE_JUDGE_FALLBACK_MODEL=mistral/magistral-small
 ```
 
 Per-host decorators are matched by the `X-RFE-Host` header (exact key), else

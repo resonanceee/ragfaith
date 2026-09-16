@@ -9,6 +9,7 @@ import {
   resolveProvider,
   parseVerdict,
   buildNudge,
+  flagVerdicts,
   PremiseStore,
   Judge,
   makeCache,
@@ -20,6 +21,7 @@ import {
   isSensitivePath,
   redactSecrets,
   maxClaims,
+  selectPremise,
   RagfaithPlugin,
   logLine,
 } from "../src/index";
@@ -68,22 +70,169 @@ describe("claim segmentation", () => {
   test("empty/whitespace drops out", () => {
     expect(segmentClaims("   ").length).toBe(0);
   });
+  test("markdown furniture dropped, prose kept (issue 76)", () => {
+    const claims = segmentClaims(
+      [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 — missed primary endpoint** overall, positive only in MCI subgroup ([Alzheon](https://example.com)) | The big catalyst already happened and was a miss; now in long-term extension.",
+        "^4] |",
+        '[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.',
+        "|---|---|---|",
+        "[Alzheon]: https://example.com/apolloe4",
+        "Remternetug is currently in Phase 3.",
+        "---",
+      ].join("\n"),
+    );
+    expect(claims).toEqual([
+      "Alzheon reported Phase 2 data in April 2025.",
+      "Remternetug is currently in Phase 3.",
+    ]);
+  });
+
+  test("prose containing inline links kept", () => {
+    const claims = segmentClaims(
+      "The ALZ-801 trial ([Alzheon](https://example.com)) missed its endpoint. It is now in extension.",
+    );
+    expect(claims.length).toBe(2);
+    expect(claims[0]).toContain("ALZ-801 trial");
+  });
+
+  test("footnote / meta / confidence-interval (issue 76 reopened)", () => {
+    expect(segmentClaims('[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.')).toEqual(
+      [],
+    );
+    expect(segmentClaims("Overall confidence: High.")).toEqual([]);
+    expect(segmentClaims("certainty - medium")).toEqual([]);
+    expect(segmentClaims("tl;dr: everything above was wrong")).toEqual([]);
+    expect(segmentClaims("Spoiler: the butler did it")).toEqual([]);
+    expect(segmentClaims("The confidence interval was 95%.")).toEqual([
+      "The confidence interval was 95%.",
+    ]);
+  });
+
+  test("headings dropped, never fused with following text", () => {
+    expect(
+      segmentClaims(
+        "## The ticker and the options problem (read this first)\nActual prose follows here.",
+      ),
+    ).toEqual(["Actual prose follows here."]);
+    expect(
+      segmentClaims("## What it is\nFixed-dose combo of tenofovir and emtricitabine."),
+    ).toEqual(["Fixed-dose combo of tenofovir and emtricitabine."]);
+    expect(segmentClaims("#trending topic line here.")).toEqual(["#trending topic line here."]);
+  });
+
+  test("mega block never fuses (production Estelle case)", () => {
+    const claims = segmentClaims(
+      [
+        "Yo twin, here's the rundown on Estelle (born 1980 in Hammersmith, London):",
+        "",
+        "**Who she is**",
+        "- British singer blending R&B, soul and grime ([Wikipedia](https://example.com))",
+        "- Started out in London's Deal Real record store; John Legend became her mentor",
+        "- Debut album The 18th Day dropped in 2005",
+      ].join("\n"),
+    );
+    const markers = ["R&B", "John Legend", "18th Day"];
+    for (const c of claims) {
+      expect(markers.filter((m) => c.includes(m)).length).toBeLessThanOrEqual(1);
+      expect(c).not.toContain("**Who she is**");
+      expect(c.length).toBeLessThanOrEqual(300);
+    }
+    expect(claims.some((c) => c.startsWith("Yo twin"))).toBe(true);
+    expect(claims.some((c) => c.includes("Deal Real record store"))).toBe(true);
+    expect(claims.some((c) => c.startsWith("Debut album"))).toBe(true);
+  });
+
+  test("bold label dropped, bold-leading claim kept", () => {
+    expect(segmentClaims("**Who she is**")).toEqual([]);
+    expect(segmentClaims("*Summary*")).toEqual([]);
+    expect(segmentClaims("**Alzheon** reported Phase 2 data in April 2025.")).toEqual([
+      "**Alzheon** reported Phase 2 data in April 2025.",
+    ]);
+  });
+
+  test("overlong sentences resplit at clauses, unsplittable dropped", () => {
+    const src =
+      "The committee reviewed the full dossier over several weeks " +
+      "and interviewed witnesses ".repeat(8) +
+      "; then it voted to release the findings; and the chair signed the final report.";
+    const claims = segmentClaims(src);
+    expect(claims.length).toBeGreaterThan(1);
+    for (const c of claims) expect(c.length).toBeLessThanOrEqual(300);
+    expect(claims.some((c) => c.includes("voted to release"))).toBe(true);
+    expect(claims.some((c) => c.includes("signed the final report"))).toBe(true);
+    for (const c of claims) {
+      expect(c.includes("reviewed the full dossier") && c.includes("voted")).toBe(false);
+    }
+    expect(segmentClaims(("word ".repeat(120)).trim())).toEqual([]);
+  });
+
+  test("code fence / blockquote / numbered list / hr / bold-start", () => {
+    expect(segmentClaims("```python\nprint('hello world')\n```\nThe sky is blue.")).toEqual([
+      "The sky is blue.",
+    ]);
+    expect(segmentClaims("> The tower is in Paris.")).toEqual(["The tower is in Paris."]);
+    expect(segmentClaims("1. Cats cannot fly.\n2) Dogs bark.")).toEqual([
+      "Cats cannot fly.",
+      "Dogs bark.",
+    ]);
+    expect(
+      segmentClaims(["---", "***", "___", ":---", "***Bold emphasis opens a real claim about Paris."].join("\n")),
+    ).toEqual(["***Bold emphasis opens a real claim about Paris."]);
+  });
+
+  test("corpus invariants over production-shaped reply", () => {
+    const corpus = [
+      "## Quick takes",
+      "Here is the summary you asked for:",
+      "",
+      "| Ticker | Status |",
+      "|---|---|",
+      "| ALZH | missed endpoint |",
+      "[^1]: Source, title, 2026.",
+      "```",
+      "const x = 1;",
+      "```",
+      "**Who she is**",
+      "- Estelle was born in 1980 in Hammersmith, London.",
+      "- She blends R&B, soul, reggae, grime and dance.",
+      "Overall confidence: High.",
+      "Remternetug is currently in Phase 3 trials.",
+      "The committee reviewed the full dossier over several weeks " +
+        "and interviewed witnesses ".repeat(8) +
+        "; then it voted to release the findings.",
+    ].join("\n");
+    const claims = segmentClaims(corpus);
+    expect(claims.length).toBeGreaterThan(0);
+    for (const c of claims) {
+      expect(c.length).toBeLessThanOrEqual(300);
+      expect(c.trimStart().startsWith("|") || c.trimStart().startsWith("[^")).toBe(false);
+      expect(c).not.toContain("Overall confidence");
+      expect(c).not.toContain("const x");
+    }
+    expect(claims.some((c) => c.startsWith("Estelle was born in 1980"))).toBe(true);
+    expect(claims.some((c) => c.startsWith("She blends"))).toBe(true);
+    expect(claims.some((c) => c.includes("Remternetug"))).toBe(true);
+    expect(claims.some((c) => c.includes("voted to release"))).toBe(true);
+    expect(claims.every((c) => !c.includes("Ticker"))).toBe(true);
+  });
 });
 
 describe("judge selection", () => {
   const cfg = resolveProvider({
-    RFE_JUDGE_GLM_MODEL: GLM,
-    RFE_JUDGE_DEEPSEEK_MODEL: DS,
+    RFE_JUDGE_MAIN_MODEL: GLM,
+    RFE_JUDGE_FALLBACK_MODEL: DS,
   } as Record<string, string>);
 
-  test("glm-flash active -> deepseek judge", () => {
+  test("main judge active -> fallback judge", () => {
     expect(selectJudgeModel(GLM, cfg)).toBe(DS);
     expect(selectJudgeModel("z-ai/glm-5.3-flash", cfg)).toBe(DS);
     expect(selectJudgeModel("hf:zai-org/GLM-5.3-Flash", cfg)).toBe(DS);
     expect(selectJudgeModel("z-ai/glm-5.3-flash:free", cfg)).toBe(DS);
   });
 
-  test("anything else -> glm judge", () => {
+  test("anything else -> main judge", () => {
     expect(selectJudgeModel("anthropic/claude-sonnet-4", cfg)).toBe(GLM);
     expect(selectJudgeModel("openai/gpt-5", cfg)).toBe(GLM);
     expect(selectJudgeModel("unknown", cfg)).toBe(GLM);
@@ -93,30 +242,30 @@ describe("judge selection", () => {
     const judge = selectJudgeModel(GLM, cfg);
     expect(judge).not.toBe(GLM);
     expect(judge).toBe(DS);
-    // and if the deepseek judge itself were active, judge flips back to glm
+    // and if the fallback judge itself were active, judge flips back to the main
     expect(selectJudgeModel(DS, cfg)).toBe(GLM);
   });
 
   test("provider-specific env overrides win", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
-      RFE_OPENROUTER_DEEPSEEK_MODEL: "custom/ds",
-      RFE_OPENROUTER_GLM_MODEL: "custom/glm",
+      RFE_OPENROUTER_FALLBACK_MODEL: "custom/ds",
+      RFE_OPENROUTER_MAIN_MODEL: "custom/glm",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("custom/glm");
-    expect(c.deepseekModel).toBe("custom/ds");
+    expect(c.mainModel).toBe("custom/glm");
+    expect(c.fallbackModel).toBe("custom/ds");
     expect(c.baseUrl).toBe("https://openrouter.ai/api/v1");
   });
 
   test("generic env overrides win over provider-specific and defaults", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
-      RFE_OPENROUTER_GLM_MODEL: "preset/glm",
-      RFE_JUDGE_GLM_MODEL: "any-provider/glm",
-      RFE_JUDGE_DEEPSEEK_MODEL: "any-provider/ds",
+      RFE_OPENROUTER_MAIN_MODEL: "preset/glm",
+      RFE_JUDGE_MAIN_MODEL: "any-provider/glm",
+      RFE_JUDGE_FALLBACK_MODEL: "any-provider/ds",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("any-provider/glm");
-    expect(c.deepseekModel).toBe("any-provider/ds");
+    expect(c.mainModel).toBe("any-provider/glm");
+    expect(c.fallbackModel).toBe("any-provider/ds");
   });
 
   test("any OpenAI-compatible provider + custom ids works (no hf/ shape needed)", () => {
@@ -124,8 +273,8 @@ describe("judge selection", () => {
       RFE_JUDGE_PROVIDER: "my-endpoint",
       RFE_JUDGE_BASE_URL: "https://llm.internal/v1",
       RFE_JUDGE_API_KEY: "k",
-      RFE_JUDGE_GLM_MODEL: "openai/gpt-oss-120b",
-      RFE_JUDGE_DEEPSEEK_MODEL: "mistral/magistral-small",
+      RFE_JUDGE_MAIN_MODEL: "openai/gpt-oss-120b",
+      RFE_JUDGE_FALLBACK_MODEL: "mistral/magistral-small",
     } as Record<string, string>);
     expect(c.baseUrl).toBe("https://llm.internal/v1");
     expect(c.apiKey).toBe("k");
@@ -138,25 +287,25 @@ describe("judge selection", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "synthetic",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("hf:zai-org/GLM-5.3-Flash");
-    expect(c.deepseekModel).toBe("hf:deepseek-ai/DeepSeek-V4.1-Flash");
+    expect(c.mainModel).toBe("hf:zai-org/GLM-5.3-Flash");
+    expect(c.fallbackModel).toBe("hf:deepseek-ai/DeepSeek-V4.1-Flash");
   });
 
   test("openrouter preset defaults", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("z-ai/glm-5.3-flash");
-    expect(c.deepseekModel).toBe("deepseek/deepseek-v4.1-flash");
+    expect(c.mainModel).toBe("z-ai/glm-5.3-flash");
+    expect(c.fallbackModel).toBe("deepseek/deepseek-v4.1-flash");
   });
 
-  test("active-model check references the configured glm model, not a fixed id", () => {
+  test("active-model check references the configured main judge model, not a fixed id", () => {
     expect(isGlmFlash("z-ai/glm-5-flash")).toBe(false);
     expect(selectJudgeModel("z-ai/glm-5-flash", cfg)).toBe(GLM);
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "custom",
-      RFE_JUDGE_GLM_MODEL: "local/glm-5.3-flash",
-      RFE_JUDGE_DEEPSEEK_MODEL: "local/ds",
+      RFE_JUDGE_MAIN_MODEL: "local/glm-5.3-flash",
+      RFE_JUDGE_FALLBACK_MODEL: "local/ds",
     } as Record<string, string>);
     expect(isActiveJudgeModel("local/glm-5.3-flash", c)).toBe(true);
     expect(isActiveJudgeModel("local/glm-5.3-flash:free", c)).toBe(true);
@@ -200,6 +349,42 @@ describe("verdict parsing", () => {
     expect(judge.parseErrors).toBe(1);
     expect(judge.callFailures).toBe(0);
     expect(calls).toBe(2); // retry once with 2x max_tokens on parse failure
+  });
+});
+
+describe("judge audit rows (issue 82)", () => {
+  test("parse-error row carries context_chars + retry tokens; judge rows too", async () => {
+    const lines: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      const judge = new Judge({
+        baseUrl: "https://x.test",
+        apiKey: "k",
+        model: GLM,
+        session: "s",
+        logFile: "stderr",
+        fetchImpl: (async () => ({
+          ok: true,
+          status: 200,
+          json: async () => okResp("nonsense"),
+        })) as unknown as typeof fetch,
+        sleepImpl: noSleep,
+      });
+      const ctx = "Cats cannot fly.";
+      expect(await judge.verdict(ctx, "Cats can fly.")).toBe("unverifiable");
+      const errRow = JSON.parse(lines.find((l) => l.includes('"judge-parse-error"'))!);
+      expect(errRow.context_chars).toBe(ctx.length);
+      expect(errRow.retry_prompt_tokens).toBeGreaterThan(0); // 2 attempts x 10
+      expect(errRow.retry_completion_tokens).toBeGreaterThan(0); // 2 attempts x 5
+      const judgeRow = JSON.parse(lines.find((l) => l.includes('"kind":"judge"'))!);
+      expect(judgeRow.context_chars).toBe(ctx.length);
+    } finally {
+      process.stderr.write = origWrite;
+    }
   });
 });
 
@@ -425,6 +610,42 @@ describe("premise cap", () => {
   });
 });
 
+describe("premise selection (issue 82)", () => {
+  test("short blob returned whole", () => {
+    const src = "Alpha is A.\n\nBeta is B.";
+    expect(selectPremise(src, "What is Alpha?")).toBe(src);
+  });
+
+  test("relevant passage kept, filler dropped, within budget", () => {
+    const passages = Array.from(
+      { length: 20 },
+      (_, i) => `Filler document number ${i} discusses unrelated matters. ${"y".repeat(700)}`,
+    );
+    const relevant = "Alpha concentration measured in serum samples was elevated.";
+    passages[3] = relevant;
+    const src = passages.join("\n\n");
+    const out = selectPremise(src, "Was the Alpha concentration elevated?");
+    expect(out).toContain(relevant);
+    expect(out).not.toContain("Filler document number 19");
+    expect(out.length).toBeLessThanOrEqual(12_000);
+  });
+
+  test("oversized relevant passage head-truncated", () => {
+    const src = ["zz".repeat(50), `Alpha serum levels rose sharply. ${"q".repeat(20000)}`].join(
+      "\n\n",
+    );
+    const out = selectPremise(src, "Did Alpha serum levels rise?");
+    expect(out.startsWith("Alpha serum levels rose sharply.")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(12_000);
+  });
+
+  test("no overlap falls back to most recent chars", () => {
+    const src = Array.from({ length: 10 }, (_, i) => `${String(i).padStart(2, "0")} ${"z".repeat(2000)}`).join("\n\n");
+    const out = selectPremise(src, "Completely unrelated xylophone question?");
+    expect(out).toBe(src.slice(-4000));
+  });
+});
+
 describe("nudge aggregation", () => {
   test("2 flagged claims -> exactly one nudge message", () => {
     const nudge = buildNudge(GLM, [
@@ -437,6 +658,36 @@ describe("nudge aggregation", () => {
     expect(nudge).toContain("unverifiable (1)");
     expect(nudge).toContain("do not invent corrections");
     expect((nudge.match(/ragfaith judge/g) ?? []).length).toBe(1);
+  });
+
+  test("unverifiable claim adds provenance arm (issue #86)", () => {
+    const nudge = buildNudge(GLM, [{ claim: "Moon is cheese.", verdict: "unverifiable" }]);
+    expect(nudge).toContain("internal (training) knowledge");
+    expect(nudge).toContain("No silent assertions");
+  });
+
+  test("unfaithful-only nudge has no provenance arm", () => {
+    const nudge = buildNudge(GLM, [{ claim: "Sky is green.", verdict: "unfaithful" }]);
+    expect(nudge).not.toContain("internal (training) knowledge");
+  });
+});
+
+describe("flag verdicts (issue #86)", () => {
+  test("default fires on unfaithful only", () => {
+    expect(flagVerdicts({})).toEqual(["unfaithful"]);
+  });
+
+  test("RFE_STRICTNESS=strict adds unverifiable", () => {
+    expect(flagVerdicts({ RFE_STRICTNESS: "strict" })).toEqual([
+      "unfaithful",
+      "unverifiable",
+    ]);
+  });
+
+  test("explicit RFE_FLAG_VERDICTS wins over the preset", () => {
+    expect(
+      flagVerdicts({ RFE_STRICTNESS: "strict", RFE_FLAG_VERDICTS: "unfaithful" }),
+    ).toEqual(["unfaithful"]);
   });
 });
 

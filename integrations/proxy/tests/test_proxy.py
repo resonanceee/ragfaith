@@ -15,6 +15,7 @@ from conftest import DONE_LINE, chunk, full_msg, iter_sse_lines, post, raw_post,
 from ragfaith_proxy.decompose import split_claims
 from ragfaith_proxy.judge import Judge
 from ragfaith_proxy.proxy import (
+    Cascade,
     Config,
     apply_tool_deltas,
     harvest_premises,
@@ -40,7 +41,7 @@ def test_sse_stream_through(rig):
                 t_first = time.monotonic() - t0
             events.append(line)
     total = time.monotonic() - t0
-    assert t_first < 1.0, "first token must not wait on the cascade"
+    assert t_first is not None and t_first < 1.0, "first token must not wait on the cascade"
     assert total > 0.5, "chunks must arrive as upstream sends them, not batched"
     assert events == [c.splitlines()[0] for c in chunks]  # byte-for-byte, in order
 
@@ -80,7 +81,7 @@ def test_chain_mode(rig):
     assert msgs[-1]["role"] == "user"
     assert "1 claim(s)" in msgs[-1]["content"] and "The sky is green." in msgs[-1]["content"]
     assert len(rig.state["judge_calls"]) == 1
-    assert rig.state["judge_calls"][0]["model"] == rig.cfg.glm_model
+    assert rig.state["judge_calls"][0]["model"] == rig.cfg.main_model
 
 
 def test_chain_fallback_non_streaming(rig):
@@ -196,15 +197,15 @@ def test_client_disconnect_mid_chain_no_hang(rig):
 
 def test_select_judge():
     cfg = Config()
-    assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.deepseek_model
-    assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.deepseek_model
-    assert select_judge("glm-4.6-flash-instruct", cfg) == cfg.glm_model
-    assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.glm_model
-    assert select_judge("gpt-4o", cfg) == cfg.glm_model
+    assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.fallback_model
+    assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.fallback_model
+    assert select_judge("glm-4.6-flash-instruct", cfg) == cfg.main_model
+    assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.main_model
+    assert select_judge("gpt-4o", cfg) == cfg.main_model
 
 
 def test_select_judge_custom_configured_model():
-    cfg = Config(glm_model="local/glm-5.3-flash", deepseek_model="local/ds")
+    cfg = Config(main_model="local/glm-5.3-flash", fallback_model="local/ds")
     assert select_judge("local/glm-5.3-flash", cfg) == "local/ds"
     assert select_judge("local/glm-5.3-flash:free", cfg) == "local/ds"
     assert select_judge("local/glm-4.6-flash", cfg) == "local/glm-5.3-flash"
@@ -212,7 +213,7 @@ def test_select_judge_custom_configured_model():
 
 def test_verdict_garbage_falls_back_to_unverifiable(rig):
     rig.state["verdicts"] = ["word-salad", "still-word-salad"]
-    judge = Judge(rig.cfg.glm_model, rig.base, "k")
+    judge = Judge(rig.cfg.main_model, rig.base, "k")
     assert judge.verdict("ctx", "claim") == "unverifiable"  # 256 -> 2x tokens, then fallback
     assert len(rig.state["judge_calls"]) == 2
 
@@ -220,11 +221,11 @@ def test_verdict_garbage_falls_back_to_unverifiable(rig):
 def test_verdict_cache_hit_and_persistence(rig, tmp_path):
     rig.state["verdicts"] = ["unfaithful"]
     cache = tmp_path / "proxy-cache-x.jsonl"
-    j1 = Judge(rig.cfg.glm_model, rig.base, "k", cache_path=cache)
+    j1 = Judge(rig.cfg.main_model, rig.base, "k", cache_path=cache)
     assert j1.verdict("ctx", "claim") == "unfaithful"
     assert j1.verdict("ctx", "claim") == "unfaithful"  # in-memory hit
     assert len(rig.state["judge_calls"]) == 1
-    j2 = Judge(rig.cfg.glm_model, rig.base, "k", cache_path=cache)
+    j2 = Judge(rig.cfg.main_model, rig.base, "k", cache_path=cache)
     assert j2.verdict("ctx", "claim") == "unfaithful"  # persisted JSONL hit, no network
     assert len(rig.state["judge_calls"]) == 1
 
@@ -294,6 +295,201 @@ def test_split_claims_regex_fallback():
         assert src[start:end] == text
 
 
+# real markdown traffic from issue #76 (FlowDown reply with tables + footnotes)
+_ISSUE_MARKDOWN = "\n".join(
+    [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 "
+        "— missed primary endpoint** overall, positive only in MCI subgroup "
+        "([Alzheon](https://example.com)) | The big catalyst already happened "
+        "and was a miss; now in long-term extension.",
+        "^4] |",
+        '[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.',
+        "|---|---|---|",
+        "[Alzheon]: https://example.com/apolloe4",
+        "Remternetug is currently in Phase 3.",
+        "---",
+    ]
+)
+
+
+def test_split_claims_drops_markdown_furniture():
+    texts = [t for *_, t in split_claims(_ISSUE_MARKDOWN)]
+    assert texts == [
+        "Alzheon reported Phase 2 data in April 2025.",
+        "Remternetug is currently in Phase 3.",
+    ]
+
+
+def test_split_claims_keeps_prose_containing_links():
+    src = "The ALZ-801 trial ([Alzheon](https://example.com)) missed its endpoint."
+    texts = [t for *_, t in split_claims(src)]
+    assert texts
+    assert all("|" not in t and not t.startswith(("^", "[^")) for t in texts)
+    assert "ALZ-801 trial" in " ".join(texts)
+
+
+# ------------------------------------------- issue #76 reopened: full matrix
+
+from ragfaith_proxy.decompose import MAX_CLAIM_CHARS  # noqa: E402
+
+
+def _claims(src):
+    return [t for *_, t in split_claims(src)]
+
+
+def test_issue76_footnote_citation_dropped():
+    assert _claims('[^6]: BioCosm, "Remternetug — Eli Lilly," updated 30 May 2026.') == []
+
+
+def test_issue76_meta_confidence_dropped():
+    assert _claims("Overall confidence: High.") == []
+    assert _claims("certainty - medium") == []
+    assert _claims("tl;dr: everything above was wrong") == []
+    assert _claims("Spoiler: the butler did it") == []
+
+
+def test_issue76_confidence_interval_is_a_claim():
+    src = "The confidence interval was 95%."
+    assert _claims(src) == [src]
+
+
+def test_issue76_table_rows_and_fragments_dropped():
+    src = "\n".join(
+        [
+            "^4] |",
+            "| **Alzheon (ALZH)** | ALZ-801 / APOLLOE4 | **Already read out Apr 2025 "
+            "— missed primary endpoint** overall, positive only in MCI subgroup "
+            "([Alzheon](https://example.com)) | The big catalyst already happened "
+            "and was a miss; now in long-term extension.",
+            "|---|---|---|",
+        ]
+    )
+    assert _claims(src) == []
+
+
+def test_issue76_heading_only_dropped():
+    src = "## The ticker and the options problem (read this first)\nActual prose follows here."
+    assert _claims(src) == ["Actual prose follows here."]
+
+
+def test_issue76_heading_not_fused_with_bullet():
+    src = "## What it is\nFixed-dose combo of tenofovir and emtricitabine."
+    assert _claims(src) == ["Fixed-dose combo of tenofovir and emtricitabine."]
+
+
+def test_issue76_hashtag_without_space_is_a_claim():
+    src = "#trending topic line here."
+    assert _claims(src) == [src]
+
+
+def test_issue76_mega_block_never_fuses():
+    # production case: intro + bold label + 3 bullets extracted as ONE claim.
+    # Degraded regex path may split at url dots, so assert invariants (each
+    # bullet's facts stay in their own claim), not exact counts.
+    src = "\n".join(
+        [
+            "Yo twin, here's the rundown on Estelle (born 1980 in Hammersmith, London):",
+            "",
+            "**Who she is**",
+            "- British singer blending R&B, soul and grime ([Wikipedia](https://example.com))",
+            "- Started out in London's Deal Real record store; John Legend became her mentor",
+            "- Debut album The 18th Day dropped in 2005",
+        ]
+    )
+    claims = _claims(src)
+    markers = ("R&B", "John Legend", "18th Day")
+    for c in claims:
+        hits = sum(1 for m in markers if m in c)
+        assert hits <= 1, f"bullets fused into one claim: {c!r}"
+        assert "**Who she is**" not in c, "bold label survived as claim"
+        assert len(c) <= MAX_CLAIM_CHARS
+    assert any(c.startswith("Yo twin") for c in claims)
+    assert any("Deal Real record store" in c for c in claims)
+    assert any(c.startswith("Debut album") for c in claims)
+
+
+def test_issue76_bold_label_dropped_bold_claim_kept():
+    assert _claims("**Who she is**") == []
+    assert _claims("*Summary*") == []
+    src = "**Alzheon** reported Phase 2 data in April 2025."
+    assert _claims(src) == [src]
+
+
+def test_issue76_overlong_sentence_resplit_at_clauses():
+    src = (
+        "The committee reviewed the full dossier over several weeks "
+        + "and interviewed witnesses " * 8
+        + "; then it voted to release the findings; and the chair signed the final report."
+    )
+    claims = _claims(src)
+    assert len(claims) > 1
+    assert all(len(c) <= MAX_CLAIM_CHARS for c in claims)
+    assert any("voted to release" in c for c in claims)
+    assert any("signed the final report" in c for c in claims)
+    assert all("reviewed the full dossier" not in c or "voted" not in c for c in claims)
+
+
+def test_issue76_overlong_unsplittable_dropped():
+    src = ("word " * 120).strip()  # 600 chars, no clause boundary
+    assert _claims(src) == []
+
+
+def test_issue76_code_fence_dropped():
+    src = "```python\nprint('hello world')\n```\nThe sky is blue."
+    assert _claims(src) == ["The sky is blue."]
+
+
+def test_issue76_blockquote_and_numbered_list_atomic():
+    assert _claims("> The tower is in Paris.") == ["The tower is in Paris."]
+    assert _claims("1. Cats cannot fly.\n2) Dogs bark.") == ["Cats cannot fly.", "Dogs bark."]
+
+
+def test_issue76_hr_variants_dropped_bold_start_kept():
+    src = "\n".join(
+        ["---", "***", "___", ":---", "***Bold emphasis opens a real claim about Paris."]
+    )
+    assert _claims(src) == ["***Bold emphasis opens a real claim about Paris."]
+
+
+def test_issue76_corpus_invariants():
+    # production-shaped reply mixing every garbage class: invariants must hold
+    corpus = "\n".join(
+        [
+            "## Quick takes",
+            "Here is the summary you asked for:",
+            "",
+            "| Ticker | Status |",
+            "|---|---|",
+            "| ALZH | missed endpoint |",
+            "[^1]: Source, title, 2026.",
+            "```",
+            "const x = 1;",
+            "```",
+            "**Who she is**",
+            "- Estelle was born in 1980 in Hammersmith, London.",
+            "- She blends R&B, soul, reggae, grime and dance.",
+            "Overall confidence: High.",
+            "Remternetug is currently in Phase 3 trials.",
+            "The committee reviewed the full dossier over several weeks "
+            + "and interviewed witnesses " * 8
+            + "; then it voted to release the findings.",
+        ]
+    )
+    claims = _claims(corpus)
+    assert claims, "corpus must produce claims"
+    for c in claims:
+        assert len(c) <= MAX_CLAIM_CHARS, f"mega-claim survived: {c[:80]!r}"
+        assert not c.lstrip().startswith(("|", "[^", "# ", "##")), f"furniture survived: {c[:80]!r}"
+        assert "Overall confidence" not in c
+        assert "const x" not in c
+    assert any(c.startswith("Estelle was born in 1980") for c in claims)
+    assert any(c.startswith("She blends") for c in claims)
+    assert any("Remternetug" in c for c in claims)
+    assert any("voted to release" in c for c in claims)
+    assert all("Ticker" not in c for c in claims)
+
+
 def test_inject_nudge_after_last_assistant():
     msgs = [
         {"role": "user", "content": "q"},
@@ -319,7 +515,7 @@ def test_config_from_env():
     assert cfg.upstream_base == "http://x/v1"
     assert cfg.premise_cap == 100 and cfg.nudge_mode == "next"
     assert cfg.judge_base == "https://openrouter.ai/api/v1"
-    assert cfg.glm_model == "z-ai/glm-5.3-flash"
+    assert cfg.main_model == "z-ai/glm-5.3-flash"
     assert cfg.host_decorators["flowdown"]["nudge_mode"] == "next"
     # client-auth-only: no key fields exist on the config
     assert not hasattr(cfg, "upstream_key") and not hasattr(cfg, "judge_key")
@@ -329,13 +525,13 @@ def test_config_from_env_generic_overrides_any_provider():
     env = {
         "RFE_JUDGE_PROVIDER": "my-endpoint",
         "RFE_JUDGE_BASE": "http://llm.internal/v1",
-        "RFE_JUDGE_GLM_MODEL": "openai/gpt-oss-120b",
-        "RFE_JUDGE_DEEPSEEK_MODEL": "mistral/magistral-small",
+        "RFE_JUDGE_MAIN_MODEL": "openai/gpt-oss-120b",
+        "RFE_JUDGE_FALLBACK_MODEL": "mistral/magistral-small",
     }
     cfg = Config.from_env(env)
     assert cfg.judge_base == "http://llm.internal/v1"
-    assert cfg.glm_model == "openai/gpt-oss-120b"
-    assert cfg.deepseek_model == "mistral/magistral-small"
+    assert cfg.main_model == "openai/gpt-oss-120b"
+    assert cfg.fallback_model == "mistral/magistral-small"
     assert select_judge("openai/gpt-oss-120b", cfg) == "mistral/magistral-small"
     assert select_judge("other/model", cfg) == "openai/gpt-oss-120b"
 
@@ -358,7 +554,7 @@ def test_models_fallback_on_upstream_404(rig):
     data = json.loads(resp.read())
     assert resp.status == 200
     assert data["object"] == "list"
-    assert [m["id"] for m in data["data"]] == [rig.cfg.glm_model, rig.cfg.deepseek_model]
+    assert [m["id"] for m in data["data"]] == [rig.cfg.main_model, rig.cfg.fallback_model]
 
 
 def test_models_upstream_401_passthrough(rig):
@@ -440,7 +636,7 @@ def test_judge_store_lru_evicted(rig, monkeypatch):
 
 
 def test_verdict_cache_lru_evicted(rig):
-    judge = Judge(rig.cfg.glm_model, rig.base, "k", vcache_max=2)
+    judge = Judge(rig.cfg.main_model, rig.base, "k", vcache_max=2)
     judge._store("k1", "faithful")
     judge._store("k2", "unfaithful")
     judge._store("k3", "faithful")
@@ -589,8 +785,164 @@ def test_judge_retry_budget_bounded(rig, monkeypatch):
     sleeps = []
     monkeypatch.setattr(judge_mod.time, "sleep", lambda s: sleeps.append(s))
     rig.state["judge_fail_status"] = 500
-    judge = Judge(rig.cfg.glm_model, rig.base, "k")
+    judge = Judge(rig.cfg.main_model, rig.base, "k")
     with pytest.raises(urllib.error.HTTPError):
         judge.verdict("ctx", "claim")
     assert len(rig.state["judge_calls"]) == judge_mod.RETRIES
     assert sum(sleeps) <= 15, "retry sleeps must stay bounded"
+
+
+# ---------------------------------------------------------------- premise selection (issue #82)
+
+from ragfaith_proxy.proxy import select_premise  # noqa: E402
+
+
+def test_premise_cap_default_static():
+    # issue #82: 0.1.7's dynamic half-context cap sent 822k prompt tokens for
+    # one reply; default is back to a static 24k chars
+    assert Config.from_env({}).premise_cap == 24000
+
+
+def test_select_premise_short_blob_returned_whole():
+    src = "Alpha is A.\n\nBeta is B."
+    assert select_premise(src, "What is Alpha?") == src
+
+
+def test_select_premise_picks_relevant_within_budget():
+    passages = [
+        f"Filler document number {i} discusses unrelated matters. " + "y" * 700 for i in range(20)
+    ]
+    relevant = "Alpha concentration measured in serum samples was elevated."
+    passages[3] = relevant
+    src = "\n\n".join(passages)
+    out = select_premise(src, "Was the Alpha concentration elevated?")
+    assert relevant in out
+    assert "Filler document number 19" not in out
+    assert len(out) <= 12000
+
+
+def test_select_premise_oversized_relevant_passage_head_truncated():
+    passages = ["zz" * 50] + ["Alpha serum levels rose sharply. " + "q" * 20000]
+    src = "\n\n".join(passages)
+    out = select_premise(src, "Did Alpha serum levels rise?")
+    assert out.startswith("Alpha serum levels rose sharply.")
+    assert len(out) <= 12000
+
+
+def test_select_premise_no_overlap_falls_back_to_recent():
+    src = "\n\n".join(f"{i:02d} " + "z" * 2000 for i in range(10))
+    out = select_premise(src, "Completely unrelated xylophone question?")
+    assert out == src[-4000:]
+
+
+def test_judge_receives_selected_premise_not_full_blob(rig):
+    # selection re-prioritizes within the 24k premise window: relevant chunk
+    # kept, filler dropped, judge sees <= budget chars
+    rig.state["verdicts"] = ["unfaithful"]
+    rig.state["script"] = [{"stream": [chunk("Alpha serum rose.", finish="stop"), DONE_LINE]}]
+    passages = [f"Filler topic {i}. " + "y" * 900 for i in range(22)]
+    passages.insert(3, "Alpha serum levels were elevated in the study.")
+    _, resp = post(
+        rig,
+        {
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "what about alpha serum?"},
+                {"role": "tool", "content": "\n\n".join(passages)},
+            ],
+        },
+    )
+    resp.read()
+    assert wait_ends(rig.cascade, 1)
+    with rig.state["lock"]:
+        ctx = rig.state["judge_calls"][0]["messages"][-1]["content"]
+    assert "Alpha serum levels were elevated" in ctx
+    assert "Filler topic 21" not in ctx
+    assert len(ctx) < 12000 + 200
+
+
+def test_openrouter_judge_uses_own_key(rig, monkeypatch):
+    # issue #88: the client's upstream token 401s against openrouter; the
+    # judge must authenticate with OPENROUTER_API_KEY (and share one judge)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_provider="openrouter",
+        )
+    )
+    j1 = cascade.judge(rig.cfg.main_model, "client-token")
+    j2 = cascade.judge(rig.cfg.main_model, "other-client-token")
+    assert j1.api_key == "sk-or-test"
+    assert j1 is j2  # shared judge key collapses the cache to per-model
+
+
+def test_openrouter_judge_falls_back_to_client_token(rig, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_provider="openrouter",
+        )
+    )
+    assert cascade.judge(rig.cfg.main_model, "client-token").api_key == "client-token"
+
+
+def test_judge_row_carries_context_chars(rig):
+    import tempfile
+    from pathlib import Path
+
+    logfile = Path(tempfile.gettempdir()) / "rfe-context-chars-test.jsonl"
+    open(logfile, "w").close()
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_log=str(logfile),
+        )
+    )
+    judge = cascade.judge(rig.cfg.main_model, "tok")
+    rig.state["verdicts"] = ["unfaithful"]
+    assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unfaithful"
+    rows = [json.loads(x) for x in logfile.read_text().splitlines() if x.strip()]
+    judge_rows = [r for r in rows if r.get("kind") == "judge"]
+    assert judge_rows and all(isinstance(r.get("context_chars"), int) for r in judge_rows)
+    assert judge_rows[0]["context_chars"] == len("Cats cannot fly.")
+
+
+def test_parse_error_row_counts_retry_tokens(rig):
+    import tempfile
+    from pathlib import Path
+
+    logfile = Path(tempfile.gettempdir()) / "rfe-parse-error-test.jsonl"
+    open(logfile, "w").close()
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_log=str(logfile),
+        )
+    )
+    judge = cascade.judge(rig.cfg.main_model, "tok")
+    rig.state["judge_content"] = "not json at all"
+    try:
+        assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unverifiable"
+    finally:
+        rig.state["judge_content"] = None
+    rows = [json.loads(x) for x in logfile.read_text().splitlines() if x.strip()]
+    err = [r for r in rows if r.get("kind") == "judge-parse-error"]
+    assert err, "parse error row missing"
+    assert err[0]["retry_prompt_tokens"] > 0  # 2 attempts x 11 prompt tokens
+    assert err[0]["retry_completion_tokens"] > 0
+    assert err[0]["context_chars"] == len("Cats cannot fly.")

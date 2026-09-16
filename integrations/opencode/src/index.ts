@@ -74,8 +74,8 @@ export interface JudgeProviderConfig {
   provider: string;
   baseUrl: string;
   apiKey: string;
-  glmModel: string;
-  deepseekModel: string;
+  mainModel: string;
+  fallbackModel: string;
 }
 
 export function resolveProvider(
@@ -90,17 +90,17 @@ export function resolveProvider(
     env["RFE_JUDGE_API_KEY"] ?? (isOpenRouter ? env["OPENROUTER_API_KEY"] : env["SYNTHETIC_API_KEY"]) ?? "";
   // generic model overrides take precedence over provider-specific vars, so any
   // OpenAI-compatible endpoint works without synthetic-style model ids
-  const glmModel =
-    env["RFE_JUDGE_GLM_MODEL"] ??
+  const mainModel =
+    env["RFE_JUDGE_MAIN_MODEL"] ??
     (isOpenRouter
-      ? env["RFE_OPENROUTER_GLM_MODEL"] ?? "z-ai/glm-5.3-flash"
-      : env["RFE_SYNTHETIC_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash");
-  const deepseekModel =
-    env["RFE_JUDGE_DEEPSEEK_MODEL"] ??
+      ? env["RFE_OPENROUTER_MAIN_MODEL"] ?? "z-ai/glm-5.3-flash"
+      : env["RFE_SYNTHETIC_MAIN_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash");
+  const fallbackModel =
+    env["RFE_JUDGE_FALLBACK_MODEL"] ??
     (isOpenRouter
-      ? env["RFE_OPENROUTER_DEEPSEEK_MODEL"] ?? "deepseek/deepseek-v4.1-flash"
-      : env["RFE_SYNTHETIC_DEEPSEEK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash");
-  return { provider, baseUrl, apiKey, glmModel, deepseekModel };
+      ? env["RFE_OPENROUTER_FALLBACK_MODEL"] ?? "deepseek/deepseek-v4.1-flash"
+      : env["RFE_SYNTHETIC_FALLBACK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash");
+  return { provider, baseUrl, apiKey, mainModel, fallbackModel };
 }
 
 function premiseToolsRegex(
@@ -128,19 +128,176 @@ export function maxClaims(
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_CLAIMS;
 }
 
+/** Verdicts that trigger a nudge (issue #86): normal = unfaithful only;
+ *  RFE_STRICTNESS=strict adds unverifiable; explicit RFE_FLAG_VERDICTS wins. */
+export function flagVerdicts(
+  env: Record<string, string | undefined> = process.env,
+): Verdict[] {
+  const csv = env["RFE_FLAG_VERDICTS"];
+  if (csv) {
+    const items = csv
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v): v is Verdict => (VERDICTS as readonly string[]).includes(v));
+    if (items.length) return items;
+  }
+  return env["RFE_STRICTNESS"] === "strict"
+    ? ["unfaithful", "unverifiable"]
+    : ["unfaithful"];
+}
+
+// ---------------------------------------------------------------------------
+// per-claim premise selection (issue #82)
+// ---------------------------------------------------------------------------
+
+// English glue words excluded from premise/claim overlap scoring; content
+// words carry the signal (also covers DE/IT reasonably via unicode \p{L})
+const STOPWORDS = new Set(
+  ("the a an and or of to in on for with is are was were be been it this that " +
+    "these those as at by from not but if then than so such into over under " +
+    "about their its his her they them you your we our can could will would " +
+    "should may might must do does did done have has had what which who whom " +
+    "when where why how").split(" "),
+);
+
+const DEFAULT_PREMISE_BUDGET = 12_000;
+const DEFAULT_PREMISE_FALLBACK = 4_000;
+
+// conservative label under premise filtering (issue #86): support missing only
+// because of truncation must not read as fabrication
+export const TRUNCATION_NOTE =
+  "\n\n[NOTE: this context is a relevance-filtered excerpt of the pulled " +
+  'sources; if the claim\'s support is missing only because of that filtering ' +
+  'or truncation, answer "unverifiable", not "unfaithful".]';
+
+function claimTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of text.toLowerCase().matchAll(/[\p{L}\p{N}]{4,}/gu)) {
+    const t = w[0];
+    if (t && !STOPWORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+
+/** Most relevant premise passages for one claim, within `budget` chars
+ *  (lexical overlap, no embeddings). Oversized relevant passages are
+ *  head-truncated to the remaining room; with no overlap at all, the most
+ *  recent `fallback` chars are sent so the judge can answer unverifiable. */
+export function selectPremise(
+  premises: string,
+  claim: string,
+  budget = DEFAULT_PREMISE_BUDGET,
+  fallback = DEFAULT_PREMISE_FALLBACK,
+): string {
+  if (premises.length <= budget) return premises;
+  const claimToks = claimTokens(claim);
+  if (claimToks.size === 0) return premises.slice(-fallback);
+  const passages = premises.split("\n\n");
+  const scored = passages.map((p, i) => {
+    const toks = claimTokens(p);
+    let score = 0;
+    for (const t of claimToks) if (toks.has(t)) score++;
+    return { score, i, p };
+  });
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  const picked: Array<{ i: number; text: string }> = [];
+  let used = 0;
+  for (const s of scored) {
+    if (s.score <= 0 || used >= budget) continue;
+    const room = budget - used;
+    const text = s.p.length <= room ? s.p : s.p.slice(0, room);
+    picked.push({ i: s.i, text });
+    used += text.length + 2;
+  }
+  if (picked.length === 0) return premises.slice(-fallback);
+  picked.sort((a, b) => a.i - b.i);
+  return picked.map((p) => p.text).join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // claim segmentation
 // ---------------------------------------------------------------------------
 
-/** Split reply text into sentence-granularity claims via Intl.Segmenter. */
+// Longest claim handed to the judge (nudge display truncates at 200; longer
+// blobs degrade judge JSON compliance and make nudges un-actionable).
+const MAX_CLAIM_CHARS = 300;
+
+// heading lines (## ... ) — labels, not assertions
+const HEADING_RE = /^\s*#{1,6}\s+\S/;
+
+// table rows/fragments, footnotes, reference-style link definitions
+const FURNITURE_RE = /^\s*(?:\||\[\^|\^\S|\[[^\]\n]*\]:\s*<?https?:\/\/)/;
+
+// thematic breaks: --- *** ___ :--- (must be the whole line)
+const HR_RE = /^\s*:?[*_-]{3,}:?\s*$/;
+
+// meta-confidence lines: "Overall confidence: High." / "tl;dr: ..." /
+// "spoiler: ..." — never assertions. Requires : or - right after the label
+// so "Confidence interval was 95%" survives.
+const META_RE =
+  /^\s*(?:tl\s*;\s*dr|spoiler(?:\s+alert)?|(?:overall\s+)?confidence|certainty)\s*[:\-]/i;
+
+// whole-line bold/italic labels: "**Who she is**" — sub-headers, not claims
+// (content after the label keeps the line as a claim candidate)
+const LABEL_RE = /^\s*\*{1,3}[^*\n]{1,60}\*{1,3}\s*[:.]?\s*$/;
+
+// list bullets / numbered markers: content becomes its own atomic candidate
+const LIST_RE = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/;
+
+// blockquote markers
+const QUOTE_RE = /^\s*>\s?/;
+
+// clause boundaries for over-long claims: after ; : — –
+const CLAUSE_RE = /(?<=[;:\u2014\u2013])\s+/;
+
+/** Markdown-structural pre-pass (issue #76): one candidate per source line
+ *  so whole blocks never fuse into mega-claims. */
+function claimSegments(text: string): string[] {
+  const segs: string[] = [];
+  let fence = false;
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue; // blank line = hard boundary; candidates never fuse
+    if (fence) {
+      if (s.startsWith("```") || s.startsWith("~~~")) fence = false;
+      continue; // code lines are not claims
+    }
+    if (s.startsWith("```") || s.startsWith("~~~")) {
+      fence = true;
+      continue;
+    }
+    if (HR_RE.test(s) || HEADING_RE.test(s) || FURNITURE_RE.test(s)) continue;
+    if (META_RE.test(s) || LABEL_RE.test(s)) continue;
+    let t = s.replace(LIST_RE, "");
+    t = t.replace(QUOTE_RE, "");
+    if (t) segs.push(t);
+  }
+  return segs;
+}
+
+/** Enforce MAX_CLAIM_CHARS: re-split at clause boundaries, drop remnants
+ *  that are still over-long (never pass a blob to the judge). */
+function claimTexts(sentence: string): string[] {
+  if (sentence.length <= MAX_CLAIM_CHARS) return [sentence];
+  return sentence
+    .split(CLAUSE_RE)
+    .map((p) => p.trim())
+    .filter((p) => p && p.length <= MAX_CLAIM_CHARS);
+}
+
+/** Split reply text into sentence-granularity claims via Intl.Segmenter.
+ *  Markdown furniture/labels/headings/code are never claims; list items and
+ *  blockquotes are atomic; no claim exceeds MAX_CLAIM_CHARS (issue #76). */
 export function segmentClaims(text: string): string[] {
   // sentence-boundary drift vs spaCy sentencizer; swap in a real
   // segmenter lib if parity matters
   const seg = new Intl.Segmenter(undefined, { granularity: "sentence" });
   const claims: string[] = [];
-  for (const s of seg.segment(text)) {
-    const t = s.segment.trim();
-    if (t) claims.push(t);
+  for (const cand of claimSegments(text)) {
+    for (const s of seg.segment(cand)) {
+      const t = s.segment.trim();
+      if (t) claims.push(...claimTexts(t));
+    }
   }
   return claims;
 }
@@ -158,22 +315,22 @@ function normalizeModelId(model: string): string {
   return (model.toLowerCase().split("/").pop() ?? model).split(":")[0] ?? model;
 }
 
-/** True when the active model is the configured GLM judge (or the built-in
+/** True when the active model is the configured main judge (or the built-in
  *  GLM-5.3-Flash preset), ignoring provider prefix / ":" variants, so a custom
- *  GLM model id still gets never-self-judge protection. */
+ *  main-judge model id still gets never-self-judge protection. */
 export function isActiveJudgeModel(activeModel: string, cfg: JudgeProviderConfig): boolean {
   const active = normalizeModelId(activeModel);
-  const candidates = [normalizeModelId(cfg.glmModel)];
-  if (cfg.glmModel !== "glm-5.3-flash") candidates.push("glm-5.3-flash");
+  const candidates = [normalizeModelId(cfg.mainModel)];
+  if (cfg.mainModel !== "glm-5.3-flash") candidates.push("glm-5.3-flash");
   return candidates.some((c) => c !== "" && active.includes(c));
 }
 
-/** Never self-judge: active model is the GLM judge -> DeepSeek judge; else GLM. */
+/** Never self-judge: active model is the main judge -> fallback judge; else main. */
 export function selectJudgeModel(
   activeModel: string,
   cfg: JudgeProviderConfig,
 ): string {
-  return isActiveJudgeModel(activeModel, cfg) ? cfg.deepseekModel : cfg.glmModel;
+  return isActiveJudgeModel(activeModel, cfg) ? cfg.fallbackModel : cfg.mainModel;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +542,7 @@ export class Judge {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
-  private account(resp: ChatResp): void {
+  private account(resp: ChatResp, contextChars: number): void {
     const usage = resp.usage ?? {};
     logLine(
       {
@@ -395,6 +552,7 @@ export class Judge {
         model: this.checkpoint,
         prompt_tokens: usage.prompt_tokens ?? 0,
         completion_tokens: usage.completion_tokens ?? 0,
+        context_chars: contextChars,
       },
       this.o.logFile || undefined,
     );
@@ -409,9 +567,13 @@ export class Judge {
     const msg = `CONTEXT:\n${context}\n\nCLAIM:\n${claim}`;
     try {
       let parsed: Verdict | undefined;
+      let retryPrompt = 0;
+      let retryCompletion = 0;
       for (const maxTokens of [this.o.maxTokens, this.o.maxTokens * 2]) {
         const resp = await this.call(msg, maxTokens);
-        this.account(resp);
+        this.account(resp, context.length);
+        retryPrompt += resp.usage?.prompt_tokens ?? 0;
+        retryCompletion += resp.usage?.completion_tokens ?? 0;
         const content = resp.choices?.[0]?.message?.content ?? "";
         try {
           parsed = parseVerdict(content);
@@ -422,6 +584,19 @@ export class Judge {
       }
       if (parsed === undefined) {
         this.parseErrors += 1; // parse failure: conservative fallback, counted
+        logLine(
+          {
+            ts: new Date().toISOString(),
+            session: this.o.session,
+            kind: "judge-parse-error",
+            model: this.checkpoint,
+            claim,
+            context_chars: context.length,
+            retry_prompt_tokens: retryPrompt,
+            retry_completion_tokens: retryCompletion,
+          },
+          this.o.logFile || undefined,
+        );
       } else {
         verdict = parsed;
       }
@@ -519,12 +694,22 @@ export function buildNudge(judgeModel: string, flagged: FlaggedClaim[]): string 
   const claims = flagged
     .map((f, i) => `${i + 1}. [${f.verdict}] ${f.claim.slice(0, 200)}`)
     .join("\n");
-  return (
+  let out =
     `ragfaith judge (${judgeModel}): ${flagged.length} claim(s) in your last ` +
     `reply were flagged ${verdicts}.\nClaims:\n${claims}\n` +
     "Re-check against the sources actually pulled in this session and " +
-    "reconcile; do not invent corrections."
-  );
+    "reconcile; do not invent corrections.";
+  if (counts.has("unverifiable")) {
+    // strict arm (issue #86): an unverifiable claim is unattributed, not wrong
+    out +=
+      "\n\nUnverifiable claims are not in the pulled sources; resolve each " +
+      "visibly in your next reply in exactly one of these ways: (1) back it " +
+      "with further searches or fetches and cite the newly pulled source; " +
+      "(2) openly disclose that it comes from your internal (training) " +
+      "knowledge, not the pulled sources; (3) openly disclose that it was " +
+      "inferred from data inside the context. No silent assertions.";
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -623,10 +808,18 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           logFile,
         );
       }
+      const allowed = flagVerdicts();
       const flagged: FlaggedClaim[] = [];
       for (const claim of kept) {
-        const v = await judge.verdict(context, claim);
-        if (v === "unfaithful" || v === "unverifiable") {
+        const sel = selectPremise(context, claim);
+        // premise filtering dropped content: prefer the conservative label so
+        // truncation can't read as fabrication (issue #86)
+        const ctx =
+          context.length > DEFAULT_PREMISE_BUDGET
+            ? sel + TRUNCATION_NOTE
+            : sel;
+        const v = await judge.verdict(ctx, claim);
+        if (v !== "faithful" && allowed.includes(v)) {
           flagged.push({ claim, verdict: v });
         }
         // faithful: silent pass, no annotation

@@ -57,7 +57,7 @@ class SmokeJudge(Judge):
             except ValueError:
                 continue
         self.parse_failures += 1
-        return "unverifiable", True  # conservative fallback, counted against DeepSeek bar
+        return "unverifiable", True  # conservative fallback, counted against the parse bar
 
 
 def load_pairs():
@@ -121,8 +121,8 @@ def main():
 
     results = {"pairs": {}, "summary": {}}
     for label, model in (
-        ("glm", "hf:zai-org/GLM-5.3-Flash"),
-        ("deepseek", "hf:deepseek-ai/DeepSeek-V4.1-Flash"),
+        ("main", "hf:zai-org/GLM-5.3-Flash"),
+        ("fallback", "hf:deepseek-ai/DeepSeek-V4.1-Flash"),
     ):
         tokens = {"prompt": 0, "completion": 0}
 
@@ -131,7 +131,7 @@ def main():
             t["completion"] += rec["completion_tokens"]
 
         env_override = os.environ.get(
-            "RFE_SYNTHETIC_GLM_MODEL" if label == "glm" else "RFE_SYNTHETIC_DEEPSEEK_MODEL"
+            "RFE_SYNTHETIC_MAIN_MODEL" if label == "main" else "RFE_SYNTHETIC_FALLBACK_MODEL"
         )
         judge = SmokeJudge(env_override or model, base_url=base, api_key=api_key, log=log)
         verdicts = judge_all(judge, picked)
@@ -149,17 +149,17 @@ def main():
         }
         print(label, results["summary"][label])
 
-    # GLM agreement vs cache
-    glm = [(p["cache"], results["pairs"][p["id"]]["glm_verdict"]) for p in picked]
-    exact = sum(c == g for c, g in glm)
-    results["summary"]["glm"]["exact_match"] = f"{exact}/{len(glm)} ({exact / len(glm):.1%})"
-    non_fallback = [(c, g) for c, g in glm if c != "unverifiable" and g != "unverifiable"]
+    # main-judge agreement vs cache
+    main = [(p["cache"], results["pairs"][p["id"]]["main_verdict"]) for p in picked]
+    exact = sum(c == g for c, g in main)
+    results["summary"]["main"]["exact_match"] = f"{exact}/{len(main)} ({exact / len(main):.1%})"
+    non_fallback = [(c, g) for c, g in main if c != "unverifiable" and g != "unverifiable"]
     exact_nf = sum(c == g for c, g in non_fallback)
-    results["summary"]["glm"]["exact_match_non_unverifiable"] = (
+    results["summary"]["main"]["exact_match_non_unverifiable"] = (
         f"{exact_nf}/{len(non_fallback)} ({exact_nf / max(1, len(non_fallback)):.1%})"
     )
-    confusion = Counter(f"cache={c} syn={g}" for c, g in glm if c != g)
-    results["summary"]["glm"]["confusion"] = dict(confusion)
+    confusion = Counter(f"cache={c} syn={g}" for c, g in main if c != g)
+    results["summary"]["main"]["confusion"] = dict(confusion)
 
     out = Path(__file__).with_name("smoke_results.json")
     out.write_text(json.dumps(results, indent=2, ensure_ascii=False))

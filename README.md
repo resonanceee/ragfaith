@@ -8,6 +8,8 @@ We built an evaluation arena for faithfulness judges and compared a range of app
 
 The evaluation uses 18,900 English claims from RAGTruth, 800 synthetic German and Italian cases, 600 organic real world answers, and two rounds of human adjudication.
 
+The winning judge is not just a benchmark result. You can run it as a live guardrail on real conversations through two published integrations: the [ragfaith-proxy](https://pypi.org/project/ragfaith-proxy/) Python package, an OpenAI compatible sidecar for any client, and the [@resonanceee/opencode-ragfaith](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) npm package, a plugin for opencode sessions. Both are described in the [Integrations](#integrations) section below.
+
 ## The main result
 
 **[glm-5.3-flash](https://openrouter.ai/z-ai/glm-5.3-flash) was the best judge we tested, including models that cost up to 22× more per token.** Its smaller counterpart, ling-3.0-flash, costs about a quarter as much while retaining roughly 97% of the response level quality.
@@ -206,7 +208,7 @@ Both integrations use the same basic rules:
 
 An OpenAI compatible sidecar for clients that do not have a plugin system. FlowDown is the reference integration.
 
-The proxy supports SSE stream through and extracts premises from tool result messages. It supports two nudge modes, `chain` by default and `next`.
+The proxy supports SSE stream through and extracts premises from tool result messages. It supports three nudge modes: `chain` (default, the correction streams right after the flagged reply), `next` (the nudge rides in with your next message), and `regen` (the client only ever sees the final, clean response at the cost of a longer wait).
 
 The proxy does not store an API key. It forwards the client's `Authorization` header upstream and reuses it for judge calls.
 
@@ -250,7 +252,7 @@ npm install @resonanceee/opencode-ragfaith
 
 You can also copy `integrations/opencode/src/index.ts` to `~/.config/opencode/plugins/ragfaith.ts`.
 
-The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrouter` plus `OPENROUTER_API_KEY`.
+The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrouter` plus `OPENROUTER_API_KEY`. GLM-5.3-Flash stays the accuracy-first default judge; for a faster/cheaper option, set the primary judge to Ling 3.0 Flash (`RFE_JUDGE_MAIN_MODEL=inclusionai/ling-3.0-flash` on OpenRouter) — caveat: highest parse-error rate in benchmarks, so expect more `unverifiable` fallbacks until it clears the smoke gate.
 
 Published on [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) and [GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith).
 

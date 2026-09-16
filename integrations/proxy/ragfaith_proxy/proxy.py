@@ -62,10 +62,43 @@ DEFAULT_REGEN_NUDGE = (
     "the supported ones unchanged, and output ONLY that answer — no tables, "
     "no meta-commentary, no references to this correction."
 )
+DEFAULT_UNVERIFIABLE_NUDGE = (
+    "ragfaith judge ({model}): {n} claim(s) in your previous reply were flagged "
+    "unverifiable - the sources actually pulled in this conversation do not "
+    "contain them: {claims}. Resolve each flagged claim visibly in your next "
+    "reply in exactly one of these ways: (1) back it with further searches or "
+    "fetches and cite the newly pulled source; (2) openly disclose that it "
+    "comes from your internal (training) knowledge, not the pulled sources; "
+    "(3) openly disclose that it was inferred from data inside the context. "
+    "No silent assertions."
+)
+# conservative label under premise filtering (issue #86): support missing only
+# because of truncation must not read as fabrication
+_TRUNCATION_NOTE = (
+    "\n\n[NOTE: this context is a relevance-filtered excerpt of the pulled "
+    "sources; if the claim's support is missing only because of that filtering "
+    'or truncation, answer "unverifiable", not "unfaithful".]'
+)
 SSE_DONE = object()
 
 # per-conversation store bounded so long sessions can't grow memory without limit
 CONV_MESSAGE_CAP = 128
+DEFAULT_PREMISE_CAP = 24000
+
+# per-claim premise budget: relevant passages only (issue #82 - one shared
+# 24k+ blob per claim cost 822k prompt tokens and 177s judging for one reply)
+PREMISE_BUDGET = 12000
+PREMISE_FALLBACK = 4000
+
+# English glue words excluded from premise/claim overlap scoring; content
+# words carry the signal (also covers DE/IT reasonably via \w unicode)
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for with is are was were be been it this that "
+    "these those as at by from not but if then than so such into over under "
+    "about their its his her they them you your we our can could will would "
+    "should may might must do does did done have has had what which who whom "
+    "when where why how".split()
+)
 CONV_STORE_MAX = 1000
 JUDGE_STORE_MAX = 100
 
@@ -90,13 +123,19 @@ class Config:
     upstream_base: str = DEFAULT_UPSTREAM
     judge_provider: str = "synthetic"
     judge_base: str = DEFAULT_UPSTREAM
-    glm_model: str = "hf:zai-org/GLM-5.3-Flash"
-    deepseek_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
-    premise_cap: int = 24000
+    main_model: str = "hf:zai-org/GLM-5.3-Flash"
+    fallback_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
+    # char cap on judge-prompt premises (most recent kept). Static only: the
+    # 0.1.7 dynamic half-context-window default regressed badly (issue #82).
+    premise_cap: int = DEFAULT_PREMISE_CAP
     nudge_mode: str = "chain"
     nudge_template: str = DEFAULT_NUDGE
     regen_template: str = DEFAULT_REGEN_NUDGE
     flag_verdicts: tuple = ("unfaithful",)
+    # RFE_STRICTNESS preset (issue #86): normal = unfaithful only; strict also
+    # fires on unverifiable and switches to verdict-aware nudge arms
+    strictness: str = "normal"
+    unverifiable_template: str = DEFAULT_UNVERIFIABLE_NUDGE
     cache_dir: str | None = None
     judge_log: str | None = None
     host_decorators: dict = field(default_factory=lambda: {"default": {}})
@@ -107,18 +146,26 @@ class Config:
         provider = env.get("RFE_JUDGE_PROVIDER", "synthetic")
         if provider == "openrouter":
             judge_base = env.get("RFE_OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-            glm = env.get("RFE_OPENROUTER_GLM_MODEL", "z-ai/glm-5.3-flash")
-            deepseek = env.get("RFE_OPENROUTER_DEEPSEEK_MODEL", "deepseek/deepseek-v4.1-flash")
+            main = env.get("RFE_OPENROUTER_MAIN_MODEL", "z-ai/glm-5.3-flash")
+            fallback = env.get("RFE_OPENROUTER_FALLBACK_MODEL", "deepseek/deepseek-v4.1-flash")
         else:
             judge_base = env.get(
                 "RFE_SYNTHETIC_BASE", env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM)
             )
-            glm = env.get("RFE_SYNTHETIC_GLM_MODEL", "hf:zai-org/GLM-5.3-Flash")
-            deepseek = env.get("RFE_SYNTHETIC_DEEPSEEK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
+            main = env.get("RFE_SYNTHETIC_MAIN_MODEL", "hf:zai-org/GLM-5.3-Flash")
+            fallback = env.get("RFE_SYNTHETIC_FALLBACK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
         # generic overrides take precedence: any OpenAI-compatible judge works
         judge_base = env.get("RFE_JUDGE_BASE", judge_base)
-        glm = env.get("RFE_JUDGE_GLM_MODEL", glm)
-        deepseek = env.get("RFE_JUDGE_DEEPSEEK_MODEL", deepseek)
+        main = env.get("RFE_JUDGE_MAIN_MODEL", main)
+        fallback = env.get("RFE_JUDGE_FALLBACK_MODEL", fallback)
+        # RFE_STRICTNESS is a preset; an explicit RFE_FLAG_VERDICTS wins (issue #86)
+        strictness = env.get("RFE_STRICTNESS", "normal")
+        if "RFE_FLAG_VERDICTS" in env:
+            flag_verdicts = _parse_flag_verdicts(env["RFE_FLAG_VERDICTS"])
+        elif strictness == "strict":
+            flag_verdicts = ("unfaithful", "unverifiable")
+        else:
+            flag_verdicts = ("unfaithful",)
         decorators = {"default": {}}
         if env.get("RFE_HOST_CONFIG"):
             decorators.update(json.loads(Path(env["RFE_HOST_CONFIG"]).read_text()))
@@ -130,13 +177,17 @@ class Config:
             upstream_base=env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM),
             judge_provider=provider,
             judge_base=judge_base,
-            glm_model=glm,
-            deepseek_model=deepseek,
-            premise_cap=int(env.get("RFE_PREMISE_CAP", "24000")),
+            main_model=main,
+            fallback_model=fallback,
+            premise_cap=int(env.get("RFE_PREMISE_CAP", str(DEFAULT_PREMISE_CAP))),
             nudge_mode=env.get("RFE_NUDGE_MODE", "chain"),
             nudge_template=env.get("RFE_NUDGE_TEMPLATE", DEFAULT_NUDGE),
             regen_template=env.get("RFE_REGEN_NUDGE", DEFAULT_REGEN_NUDGE),
-            flag_verdicts=_parse_flag_verdicts(env.get("RFE_FLAG_VERDICTS", "unfaithful")),
+            unverifiable_template=env.get(
+                "RFE_NUDGE_TEMPLATE_UNVERIFIABLE", DEFAULT_UNVERIFIABLE_NUDGE
+            ),
+            flag_verdicts=flag_verdicts,
+            strictness=strictness,
             cache_dir=env.get("RFE_CACHE_DIR") or None,
             judge_log=env.get("RFE_JUDGE_LOG") or None,
             host_decorators=decorators,
@@ -150,13 +201,13 @@ def _bare_model_id(model: str) -> str:
 
 
 def select_judge(active_model: str, cfg: Config) -> str:
-    """Never self-judge: active model matching the configured GLM judge is judged
-    by the configured DeepSeek model; anything else by the configured GLM model."""
+    """Never self-judge: an active model matching the configured main judge is
+    judged by the configured fallback model; anything else by the main model."""
     active = _bare_model_id(active_model)
-    glm = _bare_model_id(cfg.glm_model)
-    if active and (glm == active or glm in active):
-        return cfg.deepseek_model
-    return cfg.glm_model
+    main = _bare_model_id(cfg.main_model)
+    if active and (main == active or main in active):
+        return cfg.fallback_model
+    return cfg.main_model
 
 
 def _content_text(content) -> str:
@@ -283,7 +334,7 @@ def upstream_request(
         conn_cls = http.client.HTTPSConnection
     else:
         conn_cls = http.client.HTTPConnection
-    conn = conn_cls(parts.hostname, parts.port, timeout=120)
+    conn = conn_cls(parts.hostname or "", parts.port, timeout=120)
     headers = {
         # client-auth-only: the proxy holds no key of its own
         "Authorization": auth,
@@ -294,6 +345,38 @@ def upstream_request(
         headers["Content-Type"] = "application/json"
     conn.request(method, parts.path.rstrip("/") + suffix, body=body, headers=headers)
     return conn.getresponse(), conn
+
+
+def select_premise(
+    premises: str, claim: str, budget: int = PREMISE_BUDGET, fallback: int = PREMISE_FALLBACK
+) -> str:
+    """Most relevant premise passages for one claim, within `budget` chars
+    (lexical overlap, no embeddings). Oversized relevant passages are
+    head-truncated to the remaining room; with no overlap at all, the most
+    recent `fallback` chars are sent so the judge can answer unverifiable."""
+    if len(premises) <= budget:
+        return premises
+    claim_toks = {w for w in re.findall(r"\w{4,}", claim.lower()) if w not in _STOPWORDS}
+    if not claim_toks:
+        return premises[-fallback:]
+    scored = []
+    for i, p in enumerate(premises.split("\n\n")):
+        toks = {w for w in re.findall(r"\w{4,}", p.lower()) if w not in _STOPWORDS}
+        scored.append((len(claim_toks & toks), i, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    picked: list[tuple[int, str]] = []
+    used = 0
+    for score, i, p in scored:
+        if score <= 0 or used >= budget:
+            continue
+        room = budget - used
+        chunk = p if len(p) <= room else p[:room]
+        picked.append((i, chunk))
+        used += len(chunk) + 2
+    if not picked:
+        return premises[-fallback:]
+    picked.sort(key=lambda t: t[0])
+    return "\n\n".join(chunk for _, chunk in picked)
 
 
 class Cascade:
@@ -404,8 +487,14 @@ class Cascade:
         return nudge
 
     def judge(self, model: str, token: str) -> Judge:
-        # judges are keyed by (model, client token digest): verdicts are the same
-        # for any caller, but each caller's judge authenticates with its own key
+        # The client's upstream credential is only valid when the judge
+        # provider is the same as the upstream (issue #88): with the
+        # openrouter preset the judge must authenticate with its own key.
+        if self.cfg.judge_provider == "openrouter":
+            token = os.environ.get("OPENROUTER_API_KEY", token)
+        # judges are keyed by (model, judge token digest): verdicts are the
+        # same for any caller, and a shared judge key collapses this back to
+        # a per-model cache
         cache_key = f"{model}\x00{hashlib.sha256(token.encode()).hexdigest()}"
         with self._lock:
             j = self._judges.get(cache_key)
@@ -450,7 +539,12 @@ class Cascade:
 
         def _verdict(claim: str):
             try:
-                return claim, judge.verdict(premises, claim, conversation=conv)
+                context = select_premise(premises, claim)
+                if len(premises) > PREMISE_BUDGET:
+                    # premise filtering dropped content: prefer the conservative
+                    # label so truncation can't read as fabrication (issue #86)
+                    context += _TRUNCATION_NOTE
+                return claim, judge.verdict(context, claim, conversation=conv)
             except Exception as e:  # noqa: BLE001 - cascade must never break passthrough
                 self.log({"kind": "judge-error", "error": str(e), "conversation": conv})
                 return claim, None
@@ -464,7 +558,7 @@ class Cascade:
             self.log(
                 {"kind": "judge-skipped", "n": skipped, "total": len(results), "conversation": conv}
             )
-        return [(c, v) for c, v in results if v in flag_set]
+        return [(c, v) for c, v in results if v is not None and v in flag_set]
 
 
 def _norm(path: str) -> str:
@@ -484,8 +578,8 @@ def make_handler(cascade: Cascade):
         server_version = "ragfaith-proxy"
         timeout = 60  # a stalled client cannot pin a handler thread forever
 
-        def log_message(self, fmt, *args):
-            logger.debug(fmt, *args)
+        def log_message(self, format, *args):
+            logger.debug(format, *args)
 
         def end_headers(self):
             self._response_started = True
@@ -515,15 +609,23 @@ def make_handler(cascade: Cascade):
                 fallback = {
                     "object": "list",
                     "data": [
-                        {"id": cfg.glm_model, "object": "model", "owned_by": "ragfaith-proxy"},
+                        {"id": cfg.main_model, "object": "model", "owned_by": "ragfaith-proxy"},
                         {
-                            "id": cfg.deepseek_model,
+                            "id": cfg.fallback_model,
                             "object": "model",
                             "owned_by": "ragfaith-proxy",
                         },
                     ],
                 }
                 status, raw, ctype = 200, json.dumps(fallback).encode(), "application/json"
+            elif status != 200:
+                cascade.log(
+                    {
+                        "kind": "passthrough-status",
+                        "status": status,
+                        "body": _excerpt(raw),
+                    }
+                )
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(raw)))
@@ -552,43 +654,58 @@ def make_handler(cascade: Cascade):
 
         # -- chat completions -------------------------------------------------
 
+        def _reject(self, status: int, reason: str, message: str, messages=None):
+            """Client-visible validation reject: log then answer (issue #85 —
+            a 400 the client sees must be diagnosable from the log)."""
+            # messages is unvalidated client input; only use it when it's the
+            # shape conv_key expects
+            msgs = messages if isinstance(messages, list) else []
+            cascade.log(
+                {
+                    "kind": "request-rejected",
+                    "reason": reason,
+                    "conversation": cascade.conv_key(self.headers, msgs),
+                }
+            )
+            self.send_error(status, message)
+
         def _handle_chat(self):
             length_raw = self.headers.get("Content-Length", "0") or "0"
             try:
                 length = int(length_raw)
             except (TypeError, ValueError):
                 self.close_connection = True
-                self.send_error(400, "invalid Content-Length")
+                self._reject(400, "bad-content-length", "invalid Content-Length")
                 return
             if length < 0:
                 self.close_connection = True
-                self.send_error(400, "invalid Content-Length")
+                self._reject(400, "bad-content-length", "invalid Content-Length")
                 return
             if length > MAX_BODY:
                 self.close_connection = True
-                self.send_error(413, "request body too large")
+                self._reject(413, "payload-too-large", "request body too large")
                 return
             body = self.rfile.read(length)
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError:
-                self.send_error(400, "invalid JSON body")
+                self._reject(400, "invalid-json", "invalid JSON body")
                 return
             if not isinstance(payload, dict):
-                self.send_error(400, "invalid JSON body")
+                self._reject(400, "invalid-json", "invalid JSON body")
                 return
             messages = payload.get("messages")
             if not isinstance(messages, list):
-                self.send_error(400, "messages must be a list")
+                self._reject(400, "bad-messages", "messages must be a list", messages)
                 return
             model = payload.get("model")
             if not isinstance(model, str):
-                self.send_error(400, "model must be a string")
+                self._reject(400, "bad-model", "model must be a string", messages)
                 return
             auth = self.headers.get("Authorization", "")
             if not auth:
                 # client-auth-only: proxy cannot reach upstream or judge without it
-                self.send_error(401, "Authorization header required")
+                self._reject(401, "missing-auth", "Authorization header required", messages)
                 return
             conv = cascade.conv_key(self.headers, messages)
             deco = resolve_host(cfg, self.headers)
@@ -607,6 +724,11 @@ def make_handler(cascade: Cascade):
 
             judge_model = select_judge(model, cfg)
             upstream_body = json.dumps(payload).encode()
+            if pending is not None:
+                # the injected payload is the likeliest 400 source; log its size
+                cascade.log(
+                    {"kind": "nudge-inject", "conversation": conv, "bytes": len(upstream_body)}
+                )
             try:
                 resp, conn = upstream_request(
                     cfg, "POST", "/chat/completions", upstream_body, auth=auth
@@ -619,9 +741,24 @@ def make_handler(cascade: Cascade):
                 return
             if resp.status != 200:
                 if pending is not None:
+                    cascade.log(
+                        {
+                            "kind": "nudge-request-failed",
+                            "status": resp.status,
+                            "conversation": conv,
+                        }
+                    )
                     cascade.set_nudge(conv, pending)
                 raw = resp.read()
                 conn.close()
+                cascade.log(
+                    {
+                        "kind": "passthrough-status",
+                        "status": resp.status,
+                        "conversation": conv,
+                        "body": _excerpt(raw),
+                    }
+                )
                 self.send_response(resp.status)
                 ctype = resp.getheader("Content-Type") or "application/json"
                 self.send_header("Content-Type", ctype)
@@ -676,8 +813,16 @@ def make_handler(cascade: Cascade):
                                     "conversation": conv,
                                 }
                             )
-                        deco_args = _nudge_args(judge_model, flagged)
-                        cascade.set_nudge(conv, render_template(self._template, **deco_args))
+                        cascade.set_nudge(
+                            conv,
+                            build_nudge(
+                                self._template,
+                                self._uv_template,
+                                self._strict,
+                                judge_model,
+                                flagged,
+                            ),
+                        )
                         reason = "stashed"
                     else:
                         reason = "faithful"
@@ -688,6 +833,16 @@ def make_handler(cascade: Cascade):
         @property
         def _template(self):
             return resolve_host(cfg, self.headers).get("template", cfg.nudge_template)
+
+        @property
+        def _uv_template(self):
+            return resolve_host(cfg, self.headers).get(
+                "unverifiable_template", cfg.unverifiable_template
+            )
+
+        @property
+        def _strict(self):
+            return cfg.strictness == "strict"
 
         def _stream(
             self, resp, conn, conv, payload, messages, judge_model, mode, template, auth, flag_set
@@ -777,7 +932,9 @@ def make_handler(cascade: Cascade):
                         conv, judge_model, assistant_text, _bearer_token(auth), flag_set
                     )
                     if flagged:
-                        nudge = render_template(template, **_nudge_args(judge_model, flagged))
+                        nudge = build_nudge(
+                            template, self._uv_template, self._strict, judge_model, flagged
+                        )
                         if mode == "chain":
                             try:
                                 chained_ok = self._chain(
@@ -838,7 +995,9 @@ def make_handler(cascade: Cascade):
                             conv, judge_model, assistant_text, _bearer_token(auth), flag_set
                         )
                         if flagged:
-                            nudge = render_template(template, **_nudge_args(judge_model, flagged))
+                            nudge = build_nudge(
+                                template, self._uv_template, self._strict, judge_model, flagged
+                            )
                             cascade.set_nudge(conv, nudge)
                             reason = "stashed"
                         else:
@@ -942,7 +1101,9 @@ def make_handler(cascade: Cascade):
                     conv, judge_model, assistant_text, _bearer_token(auth), flag_set
                 )
                 if flagged:
-                    nudge = render_template(template, **_nudge_args(judge_model, flagged))
+                    nudge = build_nudge(
+                        template, self._uv_template, self._strict, judge_model, flagged
+                    )
                     regen_payload = dict(
                         payload,
                         messages=[
@@ -1105,6 +1266,43 @@ def _nudge_args(judge_model: str, flagged: list[tuple[str, str]]) -> dict:
     }
 
 
+def build_nudge(template, uv_template, strict: bool, judge_model: str, flagged) -> str:
+    """Strict mode renders per-verdict arms (issue #86): the unfaithful arm
+    keeps the reconciliation text, the unverifiable arm demands provenance.
+    Normal keeps the single aggregated template."""
+    if not strict:
+        return render_template(template, **_nudge_args(judge_model, flagged))
+    parts = []
+    for tmpl, verdict in ((template, "unfaithful"), (uv_template, "unverifiable")):
+        arm = [(c, v) for c, v in flagged if v == verdict]
+        if arm:
+            parts.append(render_template(tmpl, **_nudge_args(judge_model, arm)))
+    return "\n\n".join(parts)
+
+
+# body excerpts in logs must never carry secrets (same core patterns as the
+# opencode plugin's redactSecrets)
+_SECRET_RES = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"), "sk-[REDACTED]"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE), "Bearer [REDACTED]"),
+    (
+        re.compile(
+            r"\b(api[_-]?key|token|secret|password)\s*[:=]\s*[\"'][^\"'\n]{8,}[\"']",
+            re.IGNORECASE,
+        ),
+        r"\1=[REDACTED]",
+    ),
+)
+
+
+def _excerpt(raw: bytes, cap: int = 400) -> str:
+    """Redacted, truncated body excerpt for log lines."""
+    text = raw.decode("utf-8", "replace")
+    for pattern, repl in _SECRET_RES:
+        text = pattern.sub(repl, text)
+    return text[:cap]
+
+
 def make_server(cfg: Config, cascade: Cascade | None = None):
     cascade = cascade or Cascade(cfg)
     server = ThreadingHTTPServer((cfg.proxy_host, cfg.proxy_port), make_handler(cascade))
@@ -1114,7 +1312,9 @@ def make_server(cfg: Config, cascade: Cascade | None = None):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(prog="ragfaith-proxy", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        prog="ragfaith-proxy", description=(__doc__ or "ragfaith-proxy").splitlines()[0]
+    )
     parser.add_argument("--host", default=None, help="override RFE_PROXY_HOST")
     parser.add_argument("--port", type=int, default=None, help="override RFE_PROXY_PORT")
     args = parser.parse_args()
@@ -1129,8 +1329,8 @@ def main():
         cfg.proxy_host,
         server.server_address[1],
         cfg.upstream_base,
-        cfg.glm_model,
-        cfg.deepseek_model,
+        cfg.main_model,
+        cfg.fallback_model,
         cfg.judge_provider,
         cfg.nudge_mode,
     )

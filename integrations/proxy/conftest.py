@@ -60,7 +60,7 @@ class FakeHandler(BaseHTTPRequestHandler):
         with state["lock"]:
             state["auths"].append(self.headers.get("Authorization", ""))
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        if body.get("model") in (state["glm"], state["deepseek"]):
+        if body.get("model") in (state["main"], state["fallback"]):
             self._judge(state, body)
         else:
             self._completions(state, body)
@@ -85,7 +85,16 @@ class FakeHandler(BaseHTTPRequestHandler):
             return
         resp = {
             "choices": [
-                {"message": {"content": json.dumps({"verdict": verdict})}, "finish_reason": "stop"}
+                {
+                    "message": {
+                        "content": (
+                            state["judge_content"]
+                            if state.get("judge_content") is not None
+                            else json.dumps({"verdict": verdict})
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
             ],
             "usage": {"prompt_tokens": 11, "completion_tokens": 3},
         }
@@ -136,12 +145,13 @@ def rig(request):
         "delay": 0.0,
         "judge_delay": 0.0,
         "judge_429_left": 0,
+        "judge_content": None,
         "auths": [],
         "fail_status": None,
         "fail_from": None,
         "judge_fail_status": None,
-        "glm": "test/glm-judge",
-        "deepseek": "test/ds-judge",
+        "main": "test/glm-judge",
+        "fallback": "test/ds-judge",
     }
     fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeHandler)
     fake.daemon_threads = True
@@ -152,8 +162,8 @@ def rig(request):
         proxy_port=0,
         upstream_base=base,
         judge_base=base,
-        glm_model=state["glm"],
-        deepseek_model=state["deepseek"],
+        main_model=state["main"],
+        fallback_model=state["fallback"],
         judge_log=judge_log,
     )
     server, cascade = make_server(cfg)
