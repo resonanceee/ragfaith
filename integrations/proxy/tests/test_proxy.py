@@ -41,7 +41,7 @@ def test_sse_stream_through(rig):
                 t_first = time.monotonic() - t0
             events.append(line)
     total = time.monotonic() - t0
-    assert t_first < 1.0, "first token must not wait on the cascade"
+    assert t_first is not None and t_first < 1.0, "first token must not wait on the cascade"
     assert total > 0.5, "chunks must arrive as upstream sends them, not batched"
     assert events == [c.splitlines()[0] for c in chunks]  # byte-for-byte, in order
 
@@ -81,7 +81,7 @@ def test_chain_mode(rig):
     assert msgs[-1]["role"] == "user"
     assert "1 claim(s)" in msgs[-1]["content"] and "The sky is green." in msgs[-1]["content"]
     assert len(rig.state["judge_calls"]) == 1
-    assert rig.state["judge_calls"][0]["model"] == rig.cfg.glm_model
+    assert rig.state["judge_calls"][0]["model"] == rig.cfg.main_model
 
 
 def test_chain_fallback_non_streaming(rig):
@@ -197,15 +197,15 @@ def test_client_disconnect_mid_chain_no_hang(rig):
 
 def test_select_judge():
     cfg = Config()
-    assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.deepseek_model
-    assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.deepseek_model
-    assert select_judge("glm-4.6-flash-instruct", cfg) == cfg.glm_model
-    assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.glm_model
-    assert select_judge("gpt-4o", cfg) == cfg.glm_model
+    assert select_judge("hf:zai-org/GLM-5.3-Flash", cfg) == cfg.fallback_model
+    assert select_judge("z-ai/glm-5.3-flash:free", cfg) == cfg.fallback_model
+    assert select_judge("glm-4.6-flash-instruct", cfg) == cfg.main_model
+    assert select_judge("hf:deepseek-ai/DeepSeek-V4.1-Flash", cfg) == cfg.main_model
+    assert select_judge("gpt-4o", cfg) == cfg.main_model
 
 
 def test_select_judge_custom_configured_model():
-    cfg = Config(glm_model="local/glm-5.3-flash", deepseek_model="local/ds")
+    cfg = Config(main_model="local/glm-5.3-flash", fallback_model="local/ds")
     assert select_judge("local/glm-5.3-flash", cfg) == "local/ds"
     assert select_judge("local/glm-5.3-flash:free", cfg) == "local/ds"
     assert select_judge("local/glm-4.6-flash", cfg) == "local/glm-5.3-flash"
@@ -213,7 +213,7 @@ def test_select_judge_custom_configured_model():
 
 def test_verdict_garbage_falls_back_to_unverifiable(rig):
     rig.state["verdicts"] = ["word-salad", "still-word-salad"]
-    judge = Judge(rig.cfg.glm_model, rig.base, "k")
+    judge = Judge(rig.cfg.main_model, rig.base, "k")
     assert judge.verdict("ctx", "claim") == "unverifiable"  # 256 -> 2x tokens, then fallback
     assert len(rig.state["judge_calls"]) == 2
 
@@ -221,11 +221,11 @@ def test_verdict_garbage_falls_back_to_unverifiable(rig):
 def test_verdict_cache_hit_and_persistence(rig, tmp_path):
     rig.state["verdicts"] = ["unfaithful"]
     cache = tmp_path / "proxy-cache-x.jsonl"
-    j1 = Judge(rig.cfg.glm_model, rig.base, "k", cache_path=cache)
+    j1 = Judge(rig.cfg.main_model, rig.base, "k", cache_path=cache)
     assert j1.verdict("ctx", "claim") == "unfaithful"
     assert j1.verdict("ctx", "claim") == "unfaithful"  # in-memory hit
     assert len(rig.state["judge_calls"]) == 1
-    j2 = Judge(rig.cfg.glm_model, rig.base, "k", cache_path=cache)
+    j2 = Judge(rig.cfg.main_model, rig.base, "k", cache_path=cache)
     assert j2.verdict("ctx", "claim") == "unfaithful"  # persisted JSONL hit, no network
     assert len(rig.state["judge_calls"]) == 1
 
@@ -515,7 +515,7 @@ def test_config_from_env():
     assert cfg.upstream_base == "http://x/v1"
     assert cfg.premise_cap == 100 and cfg.nudge_mode == "next"
     assert cfg.judge_base == "https://openrouter.ai/api/v1"
-    assert cfg.glm_model == "z-ai/glm-5.3-flash"
+    assert cfg.main_model == "z-ai/glm-5.3-flash"
     assert cfg.host_decorators["flowdown"]["nudge_mode"] == "next"
     # client-auth-only: no key fields exist on the config
     assert not hasattr(cfg, "upstream_key") and not hasattr(cfg, "judge_key")
@@ -525,13 +525,13 @@ def test_config_from_env_generic_overrides_any_provider():
     env = {
         "RFE_JUDGE_PROVIDER": "my-endpoint",
         "RFE_JUDGE_BASE": "http://llm.internal/v1",
-        "RFE_JUDGE_GLM_MODEL": "openai/gpt-oss-120b",
-        "RFE_JUDGE_DEEPSEEK_MODEL": "mistral/magistral-small",
+        "RFE_JUDGE_MAIN_MODEL": "openai/gpt-oss-120b",
+        "RFE_JUDGE_FALLBACK_MODEL": "mistral/magistral-small",
     }
     cfg = Config.from_env(env)
     assert cfg.judge_base == "http://llm.internal/v1"
-    assert cfg.glm_model == "openai/gpt-oss-120b"
-    assert cfg.deepseek_model == "mistral/magistral-small"
+    assert cfg.main_model == "openai/gpt-oss-120b"
+    assert cfg.fallback_model == "mistral/magistral-small"
     assert select_judge("openai/gpt-oss-120b", cfg) == "mistral/magistral-small"
     assert select_judge("other/model", cfg) == "openai/gpt-oss-120b"
 
@@ -554,7 +554,7 @@ def test_models_fallback_on_upstream_404(rig):
     data = json.loads(resp.read())
     assert resp.status == 200
     assert data["object"] == "list"
-    assert [m["id"] for m in data["data"]] == [rig.cfg.glm_model, rig.cfg.deepseek_model]
+    assert [m["id"] for m in data["data"]] == [rig.cfg.main_model, rig.cfg.fallback_model]
 
 
 def test_models_upstream_401_passthrough(rig):
@@ -636,7 +636,7 @@ def test_judge_store_lru_evicted(rig, monkeypatch):
 
 
 def test_verdict_cache_lru_evicted(rig):
-    judge = Judge(rig.cfg.glm_model, rig.base, "k", vcache_max=2)
+    judge = Judge(rig.cfg.main_model, rig.base, "k", vcache_max=2)
     judge._store("k1", "faithful")
     judge._store("k2", "unfaithful")
     judge._store("k3", "faithful")
@@ -785,7 +785,7 @@ def test_judge_retry_budget_bounded(rig, monkeypatch):
     sleeps = []
     monkeypatch.setattr(judge_mod.time, "sleep", lambda s: sleeps.append(s))
     rig.state["judge_fail_status"] = 500
-    judge = Judge(rig.cfg.glm_model, rig.base, "k")
+    judge = Judge(rig.cfg.main_model, rig.base, "k")
     with pytest.raises(urllib.error.HTTPError):
         judge.verdict("ctx", "claim")
     assert len(rig.state["judge_calls"]) == judge_mod.RETRIES
@@ -862,6 +862,39 @@ def test_judge_receives_selected_premise_not_full_blob(rig):
     assert len(ctx) < 12000 + 200
 
 
+def test_openrouter_judge_uses_own_key(rig, monkeypatch):
+    # issue #88: the client's upstream token 401s against openrouter; the
+    # judge must authenticate with OPENROUTER_API_KEY (and share one judge)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_provider="openrouter",
+        )
+    )
+    j1 = cascade.judge(rig.cfg.main_model, "client-token")
+    j2 = cascade.judge(rig.cfg.main_model, "other-client-token")
+    assert j1.api_key == "sk-or-test"
+    assert j1 is j2  # shared judge key collapses the cache to per-model
+
+
+def test_openrouter_judge_falls_back_to_client_token(rig, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cascade = Cascade(
+        Config(
+            proxy_port=0,
+            upstream_base=rig.base,
+            judge_base=rig.base,
+            main_model=rig.cfg.main_model,
+            judge_provider="openrouter",
+        )
+    )
+    assert cascade.judge(rig.cfg.main_model, "client-token").api_key == "client-token"
+
+
 def test_judge_row_carries_context_chars(rig):
     import tempfile
     from pathlib import Path
@@ -873,11 +906,11 @@ def test_judge_row_carries_context_chars(rig):
             proxy_port=0,
             upstream_base=rig.base,
             judge_base=rig.base,
-            glm_model=rig.cfg.glm_model,
+            main_model=rig.cfg.main_model,
             judge_log=str(logfile),
         )
     )
-    judge = cascade.judge(rig.cfg.glm_model, "tok")
+    judge = cascade.judge(rig.cfg.main_model, "tok")
     rig.state["verdicts"] = ["unfaithful"]
     assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unfaithful"
     rows = [json.loads(x) for x in logfile.read_text().splitlines() if x.strip()]
@@ -897,11 +930,11 @@ def test_parse_error_row_counts_retry_tokens(rig):
             proxy_port=0,
             upstream_base=rig.base,
             judge_base=rig.base,
-            glm_model=rig.cfg.glm_model,
+            main_model=rig.cfg.main_model,
             judge_log=str(logfile),
         )
     )
-    judge = cascade.judge(rig.cfg.glm_model, "tok")
+    judge = cascade.judge(rig.cfg.main_model, "tok")
     rig.state["judge_content"] = "not json at all"
     try:
         assert judge.verdict("Cats cannot fly.", "Cats can fly.") == "unverifiable"

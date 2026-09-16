@@ -250,7 +250,7 @@ npm install @resonanceee/opencode-ragfaith
 
 You can also copy `integrations/opencode/src/index.ts` to `~/.config/opencode/plugins/ragfaith.ts`.
 
-The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrouter` plus `OPENROUTER_API_KEY`.
+The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrouter` plus `OPENROUTER_API_KEY`. GLM-5.3-Flash stays the accuracy-first default judge; for a faster/cheaper option, set the primary judge to Ling 3.0 Flash (`RFE_JUDGE_MAIN_MODEL=inclusionai/ling-3.0-flash` on OpenRouter) — caveat: highest parse-error rate in benchmarks, so expect more `unverifiable` fallbacks until it clears the smoke gate.
 
 Published on [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) and [GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith).
 

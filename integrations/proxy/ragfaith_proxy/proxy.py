@@ -123,8 +123,8 @@ class Config:
     upstream_base: str = DEFAULT_UPSTREAM
     judge_provider: str = "synthetic"
     judge_base: str = DEFAULT_UPSTREAM
-    glm_model: str = "hf:zai-org/GLM-5.3-Flash"
-    deepseek_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
+    main_model: str = "hf:zai-org/GLM-5.3-Flash"
+    fallback_model: str = "hf:deepseek-ai/DeepSeek-V4.1-Flash"
     # char cap on judge-prompt premises (most recent kept). Static only: the
     # 0.1.7 dynamic half-context-window default regressed badly (issue #82).
     premise_cap: int = DEFAULT_PREMISE_CAP
@@ -146,18 +146,18 @@ class Config:
         provider = env.get("RFE_JUDGE_PROVIDER", "synthetic")
         if provider == "openrouter":
             judge_base = env.get("RFE_OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-            glm = env.get("RFE_OPENROUTER_GLM_MODEL", "z-ai/glm-5.3-flash")
-            deepseek = env.get("RFE_OPENROUTER_DEEPSEEK_MODEL", "deepseek/deepseek-v4.1-flash")
+            main = env.get("RFE_OPENROUTER_MAIN_MODEL", "z-ai/glm-5.3-flash")
+            fallback = env.get("RFE_OPENROUTER_FALLBACK_MODEL", "deepseek/deepseek-v4.1-flash")
         else:
             judge_base = env.get(
                 "RFE_SYNTHETIC_BASE", env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM)
             )
-            glm = env.get("RFE_SYNTHETIC_GLM_MODEL", "hf:zai-org/GLM-5.3-Flash")
-            deepseek = env.get("RFE_SYNTHETIC_DEEPSEEK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
+            main = env.get("RFE_SYNTHETIC_MAIN_MODEL", "hf:zai-org/GLM-5.3-Flash")
+            fallback = env.get("RFE_SYNTHETIC_FALLBACK_MODEL", "hf:deepseek-ai/DeepSeek-V4.1-Flash")
         # generic overrides take precedence: any OpenAI-compatible judge works
         judge_base = env.get("RFE_JUDGE_BASE", judge_base)
-        glm = env.get("RFE_JUDGE_GLM_MODEL", glm)
-        deepseek = env.get("RFE_JUDGE_DEEPSEEK_MODEL", deepseek)
+        main = env.get("RFE_JUDGE_MAIN_MODEL", main)
+        fallback = env.get("RFE_JUDGE_FALLBACK_MODEL", fallback)
         # RFE_STRICTNESS is a preset; an explicit RFE_FLAG_VERDICTS wins (issue #86)
         strictness = env.get("RFE_STRICTNESS", "normal")
         if "RFE_FLAG_VERDICTS" in env:
@@ -177,8 +177,8 @@ class Config:
             upstream_base=env.get("RFE_UPSTREAM_BASE", DEFAULT_UPSTREAM),
             judge_provider=provider,
             judge_base=judge_base,
-            glm_model=glm,
-            deepseek_model=deepseek,
+            main_model=main,
+            fallback_model=fallback,
             premise_cap=int(env.get("RFE_PREMISE_CAP", str(DEFAULT_PREMISE_CAP))),
             nudge_mode=env.get("RFE_NUDGE_MODE", "chain"),
             nudge_template=env.get("RFE_NUDGE_TEMPLATE", DEFAULT_NUDGE),
@@ -201,13 +201,13 @@ def _bare_model_id(model: str) -> str:
 
 
 def select_judge(active_model: str, cfg: Config) -> str:
-    """Never self-judge: active model matching the configured GLM judge is judged
-    by the configured DeepSeek model; anything else by the configured GLM model."""
+    """Never self-judge: an active model matching the configured main judge is
+    judged by the configured fallback model; anything else by the main model."""
     active = _bare_model_id(active_model)
-    glm = _bare_model_id(cfg.glm_model)
-    if active and (glm == active or glm in active):
-        return cfg.deepseek_model
-    return cfg.glm_model
+    main = _bare_model_id(cfg.main_model)
+    if active and (main == active or main in active):
+        return cfg.fallback_model
+    return cfg.main_model
 
 
 def _content_text(content) -> str:
@@ -334,7 +334,7 @@ def upstream_request(
         conn_cls = http.client.HTTPSConnection
     else:
         conn_cls = http.client.HTTPConnection
-    conn = conn_cls(parts.hostname, parts.port, timeout=120)
+    conn = conn_cls(parts.hostname or "", parts.port, timeout=120)
     headers = {
         # client-auth-only: the proxy holds no key of its own
         "Authorization": auth,
@@ -487,8 +487,14 @@ class Cascade:
         return nudge
 
     def judge(self, model: str, token: str) -> Judge:
-        # judges are keyed by (model, client token digest): verdicts are the same
-        # for any caller, but each caller's judge authenticates with its own key
+        # The client's upstream credential is only valid when the judge
+        # provider is the same as the upstream (issue #88): with the
+        # openrouter preset the judge must authenticate with its own key.
+        if self.cfg.judge_provider == "openrouter":
+            token = os.environ.get("OPENROUTER_API_KEY", token)
+        # judges are keyed by (model, judge token digest): verdicts are the
+        # same for any caller, and a shared judge key collapses this back to
+        # a per-model cache
         cache_key = f"{model}\x00{hashlib.sha256(token.encode()).hexdigest()}"
         with self._lock:
             j = self._judges.get(cache_key)
@@ -552,7 +558,7 @@ class Cascade:
             self.log(
                 {"kind": "judge-skipped", "n": skipped, "total": len(results), "conversation": conv}
             )
-        return [(c, v) for c, v in results if v in flag_set]
+        return [(c, v) for c, v in results if v is not None and v in flag_set]
 
 
 def _norm(path: str) -> str:
@@ -572,8 +578,8 @@ def make_handler(cascade: Cascade):
         server_version = "ragfaith-proxy"
         timeout = 60  # a stalled client cannot pin a handler thread forever
 
-        def log_message(self, fmt, *args):
-            logger.debug(fmt, *args)
+        def log_message(self, format, *args):
+            logger.debug(format, *args)
 
         def end_headers(self):
             self._response_started = True
@@ -603,9 +609,9 @@ def make_handler(cascade: Cascade):
                 fallback = {
                     "object": "list",
                     "data": [
-                        {"id": cfg.glm_model, "object": "model", "owned_by": "ragfaith-proxy"},
+                        {"id": cfg.main_model, "object": "model", "owned_by": "ragfaith-proxy"},
                         {
-                            "id": cfg.deepseek_model,
+                            "id": cfg.fallback_model,
                             "object": "model",
                             "owned_by": "ragfaith-proxy",
                         },
@@ -1306,7 +1312,9 @@ def make_server(cfg: Config, cascade: Cascade | None = None):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(prog="ragfaith-proxy", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        prog="ragfaith-proxy", description=(__doc__ or "ragfaith-proxy").splitlines()[0]
+    )
     parser.add_argument("--host", default=None, help="override RFE_PROXY_HOST")
     parser.add_argument("--port", type=int, default=None, help="override RFE_PROXY_PORT")
     args = parser.parse_args()
@@ -1321,8 +1329,8 @@ def main():
         cfg.proxy_host,
         server.server_address[1],
         cfg.upstream_base,
-        cfg.glm_model,
-        cfg.deepseek_model,
+        cfg.main_model,
+        cfg.fallback_model,
         cfg.judge_provider,
         cfg.nudge_mode,
     )
