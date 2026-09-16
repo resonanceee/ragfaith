@@ -190,6 +190,26 @@ rfe exp5 --repeat 2
 
 The full reproduction guide is in [docs/reproduce.md](docs/reproduce.md).
 
+## Judge inference speed in live use
+
+Benchmarks say which judge is accurate; they do not say whether it keeps up in a real conversation. We ran the proxy against fabricated sessions with 11–19 claims per reply and measured per claim judge latency on OpenRouter, with all three judge models behind the same harness and the same queries.
+
+| Judge (OpenRouter) | p50 | p90 | max | Judge wall per reply | Parse errors | List price in/out per M tok |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| glm-5.3-flash | 0.44 s | 3.47 s | 4.30 s | 8.0–9.9 s | 13.3% | $0.075 / $0.25 |
+| deepseek-v4.1-flash | 2.22 s | 9.91 s | 20.66 s | 30.7–43.8 s | 18.2% | $0.15 / $0.60 |
+| ling-3.0-flash | 0.49 s | 1.84 s | 1.87 s | **4.5–6.5 s** | 26.3% | $0.021 / $0.063 |
+
+Two findings stood out.
+
+First, GLM keeps the best reliability to latency balance. DeepSeek is about 5× slower at p50 with a 20 second worst case and roughly twice the price, so there is no case for it as the judge here. Ling is the fastest per reply (about 2× GLM) and about 3× cheaper, but a 26.3% parse error rate means over a quarter of its calls burn a retry and parse failures fall back to `unverifiable`, which produces false flags under strict mode.
+
+Second, concurrency is not a bottleneck on OpenRouter. A probe with `RFE_JUDGE_WORKERS=16` judged all 19 claims of a reply in 15.8 s with flat per call latency and zero 429s.
+
+![Per-claim judge latency on OpenRouter](docs/figures/judge_speed_openrouter.png)
+
+*Synthetic provider footnote: the same GLM judge served through synthetic measured p50 1.95 s, p90 10.86 s, and a 65.8 s worst case per call. That gap is not the model — synthetic caps concurrent sessions (live `HTTP 429 "Too many concurrent requests"` on the chat path, plus dropped streams under load), so judge calls queue server side. OpenRouter showed no such cap at 16 concurrent judge calls. All headline times above are therefore OpenRouter to OpenRouter.*
+
 ## Integrations
 
 The evaluation eventually turned into two live faithfulness guards for real conversations.
