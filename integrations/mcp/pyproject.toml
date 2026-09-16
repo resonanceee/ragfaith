@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragfaith-mcp"
+version = "0.1.1"
+description = "MCP server for ragfaith: live faithfulness checks for RAG answers"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2",
+    "ragfaith-proxy>=0.1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+ragfaith-mcp = "ragfaith_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/resonanceee/ragfaith/tree/main/integrations/mcp"
+Repository = "https://github.com/resonanceee/ragfaith"
+Issues = "https://github.com/resonanceee/ragfaith/issues"
+
+[tool.setuptools.packages.find]
+include = ["ragfaith_mcp*"]

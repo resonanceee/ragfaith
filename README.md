@@ -212,9 +212,9 @@ Second, concurrency is not a bottleneck on OpenRouter. A probe with `RFE_JUDGE_W
 
 ## Integrations
 
-The evaluation eventually turned into two live faithfulness guards for real conversations.
+The evaluation eventually turned into live faithfulness guards for real conversations: a universal OpenAI-compatible proxy, an opencode plugin, and the `ragfaith-mcp` MCP server exposing `check_faithfulness` to any MCP-capable host.
 
-Both integrations use the same basic rules:
+All integrations use the same basic rules:
 
 * The active model never judges its own output. By default the judge is GLM-5.3-Flash, with DeepSeek-V4.1-Flash used when GLM itself is active.
 * Temperature is set to 0.
@@ -277,6 +277,16 @@ The judge needs its own key: `SYNTHETIC_API_KEY`, or `RFE_JUDGE_PROVIDER=openrou
 Published on [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) and [GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith).
 
 Setup guide: [integrations/opencode/QUICKSTART.md](integrations/opencode/QUICKSTART.md)
+
+### MCP server
+
+For MCP-capable hosts, `ragfaith-mcp` exposes `check_faithfulness(question, passages, answer)` (per-claim verdicts with the same judge) and `judge_status()` over stdio.
+
+```sh
+pip install ragfaith-mcp
+```
+
+**The model must be instructed to call it** — via the system prompt for all sessions, or the first message for one session. Suggested wording and host configuration: [docs/mcp.md](docs/mcp.md).
 
 ## Development
 
