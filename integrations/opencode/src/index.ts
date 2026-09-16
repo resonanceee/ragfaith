@@ -74,8 +74,8 @@ export interface JudgeProviderConfig {
   provider: string;
   baseUrl: string;
   apiKey: string;
-  glmModel: string;
-  deepseekModel: string;
+  mainModel: string;
+  fallbackModel: string;
 }
 
 export function resolveProvider(
@@ -90,17 +90,17 @@ export function resolveProvider(
     env["RFE_JUDGE_API_KEY"] ?? (isOpenRouter ? env["OPENROUTER_API_KEY"] : env["SYNTHETIC_API_KEY"]) ?? "";
   // generic model overrides take precedence over provider-specific vars, so any
   // OpenAI-compatible endpoint works without synthetic-style model ids
-  const glmModel =
-    env["RFE_JUDGE_GLM_MODEL"] ??
+  const mainModel =
+    env["RFE_JUDGE_MAIN_MODEL"] ??
     (isOpenRouter
-      ? env["RFE_OPENROUTER_GLM_MODEL"] ?? "z-ai/glm-5.3-flash"
-      : env["RFE_SYNTHETIC_GLM_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash");
-  const deepseekModel =
-    env["RFE_JUDGE_DEEPSEEK_MODEL"] ??
+      ? env["RFE_OPENROUTER_MAIN_MODEL"] ?? "z-ai/glm-5.3-flash"
+      : env["RFE_SYNTHETIC_MAIN_MODEL"] ?? "hf:zai-org/GLM-5.3-Flash");
+  const fallbackModel =
+    env["RFE_JUDGE_FALLBACK_MODEL"] ??
     (isOpenRouter
-      ? env["RFE_OPENROUTER_DEEPSEEK_MODEL"] ?? "deepseek/deepseek-v4.1-flash"
-      : env["RFE_SYNTHETIC_DEEPSEEK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash");
-  return { provider, baseUrl, apiKey, glmModel, deepseekModel };
+      ? env["RFE_OPENROUTER_FALLBACK_MODEL"] ?? "deepseek/deepseek-v4.1-flash"
+      : env["RFE_SYNTHETIC_FALLBACK_MODEL"] ?? "hf:deepseek-ai/DeepSeek-V4.1-Flash");
+  return { provider, baseUrl, apiKey, mainModel, fallbackModel };
 }
 
 function premiseToolsRegex(
@@ -315,22 +315,22 @@ function normalizeModelId(model: string): string {
   return (model.toLowerCase().split("/").pop() ?? model).split(":")[0] ?? model;
 }
 
-/** True when the active model is the configured GLM judge (or the built-in
+/** True when the active model is the configured main judge (or the built-in
  *  GLM-5.3-Flash preset), ignoring provider prefix / ":" variants, so a custom
- *  GLM model id still gets never-self-judge protection. */
+ *  main-judge model id still gets never-self-judge protection. */
 export function isActiveJudgeModel(activeModel: string, cfg: JudgeProviderConfig): boolean {
   const active = normalizeModelId(activeModel);
-  const candidates = [normalizeModelId(cfg.glmModel)];
-  if (cfg.glmModel !== "glm-5.3-flash") candidates.push("glm-5.3-flash");
+  const candidates = [normalizeModelId(cfg.mainModel)];
+  if (cfg.mainModel !== "glm-5.3-flash") candidates.push("glm-5.3-flash");
   return candidates.some((c) => c !== "" && active.includes(c));
 }
 
-/** Never self-judge: active model is the GLM judge -> DeepSeek judge; else GLM. */
+/** Never self-judge: active model is the main judge -> fallback judge; else main. */
 export function selectJudgeModel(
   activeModel: string,
   cfg: JudgeProviderConfig,
 ): string {
-  return isActiveJudgeModel(activeModel, cfg) ? cfg.deepseekModel : cfg.glmModel;
+  return isActiveJudgeModel(activeModel, cfg) ? cfg.fallbackModel : cfg.mainModel;
 }
 
 // ---------------------------------------------------------------------------

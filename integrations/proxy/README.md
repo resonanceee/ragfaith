@@ -62,11 +62,11 @@ client -> proxy -> upstream LLM
 
 - **Model detection**: the request's `model` field is the active model.
 - **Judge selection** (never self-judge): the active model is compared against
-  the configured GLM judge model (provider prefixes and `:` variants ignored).
-  A match is judged by the configured DeepSeek model; anything else is judged
-  by the configured GLM model. Both models are configurable for any
-  OpenAI-compatible endpoint via `RFE_JUDGE_GLM_MODEL` /
-  `RFE_JUDGE_DEEPSEEK_MODEL` — no `hf:`-style id shape required.
+  the configured main judge model (provider prefixes and `:` variants ignored).
+  A match is judged by the configured fallback model; anything else is judged
+  by the main model. Both models are configurable for any
+  OpenAI-compatible endpoint via `RFE_JUDGE_MAIN_MODEL` /
+  `RFE_JUDGE_FALLBACK_MODEL` — no `hf:`-style id shape required.
 - **Premises**: content the conversation actually pulled — `role: "tool"`
   messages and `tool_result` content blocks, capped to the most recent
   24k chars (`RFE_PREMISE_CAP`). A small per-conversation store covers clients
@@ -148,14 +148,14 @@ conversation and reconcile; do not invent corrections.
 | `RFE_UPSTREAM_BASE` | `https://api.synthetic.new/v1` | Upstream OpenAI-compatible base |
 | `RFE_JUDGE_PROVIDER` | `synthetic` | Preset: `synthetic` or `openrouter` (free-form with generic vars) |
 | `RFE_JUDGE_BASE` | preset | Generic judge base URL; overrides preset |
-| `RFE_JUDGE_GLM_MODEL` | preset | Generic primary judge model; overrides preset |
-| `RFE_JUDGE_DEEPSEEK_MODEL` | preset | Generic GLM-active judge model; overrides preset |
+| `RFE_JUDGE_MAIN_MODEL` | preset | Generic main judge model; overrides preset (e.g. `inclusionai/ling-3.0-flash` on OpenRouter — fastest/cheapest judge, but highest parse-error rate; GLM default stays accuracy-first) |
+| `RFE_JUDGE_FALLBACK_MODEL` | preset | Generic fallback judge model; overrides preset |
 | `RFE_SYNTHETIC_BASE` | upstream base | Judge base URL (synthetic preset) |
-| `RFE_SYNTHETIC_GLM_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Primary judge model (synthetic preset) |
-| `RFE_SYNTHETIC_DEEPSEEK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when active model is GLM (synthetic preset) |
+| `RFE_SYNTHETIC_MAIN_MODEL` | `hf:zai-org/GLM-5.3-Flash` | Main judge model (synthetic preset) |
+| `RFE_SYNTHETIC_FALLBACK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | Judge when the main judge is the active model (synthetic preset) |
 | `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter preset) |
-| `RFE_OPENROUTER_GLM_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter primary judge |
-| `RFE_OPENROUTER_DEEPSEEK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter GLM-active judge |
+| `RFE_OPENROUTER_MAIN_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter main judge |
+| `RFE_OPENROUTER_FALLBACK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter fallback judge |
 | `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
 | `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
 | `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
@@ -177,8 +177,8 @@ Example — judge with any OpenAI-compatible endpoint:
 ```sh
 export RFE_JUDGE_PROVIDER=my-endpoint        # preset name is free-form
 export RFE_JUDGE_BASE=http://llm.internal/v1
-export RFE_JUDGE_GLM_MODEL=openai/gpt-oss-120b
-export RFE_JUDGE_DEEPSEEK_MODEL=mistral/magistral-small
+export RFE_JUDGE_MAIN_MODEL=openai/gpt-oss-120b
+export RFE_JUDGE_FALLBACK_MODEL=mistral/magistral-small
 ```
 
 Per-host decorators are matched by the `X-RFE-Host` header (exact key), else

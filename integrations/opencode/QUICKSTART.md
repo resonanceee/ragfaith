@@ -34,7 +34,11 @@ export SYNTHETIC_API_KEY=...          # default provider
 ```
 
 Never-self-judge is automatic: if your active model is GLM-5.3-Flash, the
-plugin switches to DeepSeek-V4.1-Flash as judge (and vice versa).
+plugin switches to DeepSeek-V4.1-Flash as judge (and vice versa). To trade
+accuracy for speed/cost, put Ling 3.0 Flash in the primary judge slot:
+`RFE_JUDGE_MAIN_MODEL=inclusionai/ling-3.0-flash` (OpenRouter). Caveat: it
+has the highest parse-error rate in benchmarks, so expect more
+`unverifiable` fallbacks until it clears the smoke gate.
 
 ## 3. Use opencode normally
 

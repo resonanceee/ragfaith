@@ -221,18 +221,18 @@ describe("claim segmentation", () => {
 
 describe("judge selection", () => {
   const cfg = resolveProvider({
-    RFE_JUDGE_GLM_MODEL: GLM,
-    RFE_JUDGE_DEEPSEEK_MODEL: DS,
+    RFE_JUDGE_MAIN_MODEL: GLM,
+    RFE_JUDGE_FALLBACK_MODEL: DS,
   } as Record<string, string>);
 
-  test("glm-flash active -> deepseek judge", () => {
+  test("main judge active -> fallback judge", () => {
     expect(selectJudgeModel(GLM, cfg)).toBe(DS);
     expect(selectJudgeModel("z-ai/glm-5.3-flash", cfg)).toBe(DS);
     expect(selectJudgeModel("hf:zai-org/GLM-5.3-Flash", cfg)).toBe(DS);
     expect(selectJudgeModel("z-ai/glm-5.3-flash:free", cfg)).toBe(DS);
   });
 
-  test("anything else -> glm judge", () => {
+  test("anything else -> main judge", () => {
     expect(selectJudgeModel("anthropic/claude-sonnet-4", cfg)).toBe(GLM);
     expect(selectJudgeModel("openai/gpt-5", cfg)).toBe(GLM);
     expect(selectJudgeModel("unknown", cfg)).toBe(GLM);
@@ -242,30 +242,30 @@ describe("judge selection", () => {
     const judge = selectJudgeModel(GLM, cfg);
     expect(judge).not.toBe(GLM);
     expect(judge).toBe(DS);
-    // and if the deepseek judge itself were active, judge flips back to glm
+    // and if the fallback judge itself were active, judge flips back to the main
     expect(selectJudgeModel(DS, cfg)).toBe(GLM);
   });
 
   test("provider-specific env overrides win", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
-      RFE_OPENROUTER_DEEPSEEK_MODEL: "custom/ds",
-      RFE_OPENROUTER_GLM_MODEL: "custom/glm",
+      RFE_OPENROUTER_FALLBACK_MODEL: "custom/ds",
+      RFE_OPENROUTER_MAIN_MODEL: "custom/glm",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("custom/glm");
-    expect(c.deepseekModel).toBe("custom/ds");
+    expect(c.mainModel).toBe("custom/glm");
+    expect(c.fallbackModel).toBe("custom/ds");
     expect(c.baseUrl).toBe("https://openrouter.ai/api/v1");
   });
 
   test("generic env overrides win over provider-specific and defaults", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
-      RFE_OPENROUTER_GLM_MODEL: "preset/glm",
-      RFE_JUDGE_GLM_MODEL: "any-provider/glm",
-      RFE_JUDGE_DEEPSEEK_MODEL: "any-provider/ds",
+      RFE_OPENROUTER_MAIN_MODEL: "preset/glm",
+      RFE_JUDGE_MAIN_MODEL: "any-provider/glm",
+      RFE_JUDGE_FALLBACK_MODEL: "any-provider/ds",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("any-provider/glm");
-    expect(c.deepseekModel).toBe("any-provider/ds");
+    expect(c.mainModel).toBe("any-provider/glm");
+    expect(c.fallbackModel).toBe("any-provider/ds");
   });
 
   test("any OpenAI-compatible provider + custom ids works (no hf/ shape needed)", () => {
@@ -273,8 +273,8 @@ describe("judge selection", () => {
       RFE_JUDGE_PROVIDER: "my-endpoint",
       RFE_JUDGE_BASE_URL: "https://llm.internal/v1",
       RFE_JUDGE_API_KEY: "k",
-      RFE_JUDGE_GLM_MODEL: "openai/gpt-oss-120b",
-      RFE_JUDGE_DEEPSEEK_MODEL: "mistral/magistral-small",
+      RFE_JUDGE_MAIN_MODEL: "openai/gpt-oss-120b",
+      RFE_JUDGE_FALLBACK_MODEL: "mistral/magistral-small",
     } as Record<string, string>);
     expect(c.baseUrl).toBe("https://llm.internal/v1");
     expect(c.apiKey).toBe("k");
@@ -287,25 +287,25 @@ describe("judge selection", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "synthetic",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("hf:zai-org/GLM-5.3-Flash");
-    expect(c.deepseekModel).toBe("hf:deepseek-ai/DeepSeek-V4.1-Flash");
+    expect(c.mainModel).toBe("hf:zai-org/GLM-5.3-Flash");
+    expect(c.fallbackModel).toBe("hf:deepseek-ai/DeepSeek-V4.1-Flash");
   });
 
   test("openrouter preset defaults", () => {
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "openrouter",
     } as Record<string, string>);
-    expect(c.glmModel).toBe("z-ai/glm-5.3-flash");
-    expect(c.deepseekModel).toBe("deepseek/deepseek-v4.1-flash");
+    expect(c.mainModel).toBe("z-ai/glm-5.3-flash");
+    expect(c.fallbackModel).toBe("deepseek/deepseek-v4.1-flash");
   });
 
-  test("active-model check references the configured glm model, not a fixed id", () => {
+  test("active-model check references the configured main judge model, not a fixed id", () => {
     expect(isGlmFlash("z-ai/glm-5-flash")).toBe(false);
     expect(selectJudgeModel("z-ai/glm-5-flash", cfg)).toBe(GLM);
     const c = resolveProvider({
       RFE_JUDGE_PROVIDER: "custom",
-      RFE_JUDGE_GLM_MODEL: "local/glm-5.3-flash",
-      RFE_JUDGE_DEEPSEEK_MODEL: "local/ds",
+      RFE_JUDGE_MAIN_MODEL: "local/glm-5.3-flash",
+      RFE_JUDGE_FALLBACK_MODEL: "local/ds",
     } as Record<string, string>);
     expect(isActiveJudgeModel("local/glm-5.3-flash", c)).toBe(true);
     expect(isActiveJudgeModel("local/glm-5.3-flash:free", c)).toBe(true);

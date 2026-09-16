@@ -63,14 +63,14 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    assistant `message.updated` (`providerID/modelID`); overridable via
    `RFE_ACTIVE_MODEL`.
 4. **Judge selection** — the active model is compared against the *configured*
-   GLM judge model (`RFE_JUDGE_GLM_MODEL` / provider preset), ignoring provider
-   prefixes and `:` variants: a match → judge = the configured DeepSeek model;
-   otherwise judge = the configured GLM model. With the default synthetic preset
+   main judge model (`RFE_JUDGE_MAIN_MODEL` / provider preset), ignoring provider
+   prefixes and `:` variants: a match → judge = the configured fallback model;
+   otherwise judge = the configured main model. With the default synthetic preset
    that means a GLM-5.3-Flash active model is judged by DeepSeek-V4.1-Flash (a
    plain `glm-5-flash` is not treated as the judge model). Because the check
    uses your configured id, custom GLM-family ids still get never-self-judge
    protection. Both judge models are settable for any OpenAI-compatible
-   provider via `RFE_JUDGE_GLM_MODEL` / `RFE_JUDGE_DEEPSEEK_MODEL` — no
+   provider via `RFE_JUDGE_MAIN_MODEL` / `RFE_JUDGE_FALLBACK_MODEL` — no
    synthetic-style `hf:` id shape required.
 5. **Per reply** — on assistant `message.updated` with `time.completed`, reply
    text (accumulated from `message.part.updated`) is segmented into sentence
@@ -127,14 +127,14 @@ agent reads.
 | `RFE_JUDGE_PROVIDER`           | `synthetic`                          | provider preset; any string works with the generic vars below (`synthetic` / `openrouter` presets come with defaults) |
 | `RFE_JUDGE_BASE_URL`           | provider preset                      | generic judge API base URL (overrides preset) |
 | `RFE_JUDGE_API_KEY`            | provider preset key                  | generic judge API key (overrides `SYNTHETIC_API_KEY` / `OPENROUTER_API_KEY`) |
-| `RFE_JUDGE_GLM_MODEL`          | provider preset                      | generic GLM judge model id — use this for non-synthetic id shapes |
-| `RFE_JUDGE_DEEPSEEK_MODEL`     | provider preset                      | generic DeepSeek judge model id — use this for non-synthetic id shapes |
+| `RFE_JUDGE_MAIN_MODEL`          | provider preset                      | generic main judge model id — use this for non-synthetic id shapes (e.g. `inclusionai/ling-3.0-flash` on OpenRouter: fastest/cheapest judge, but highest parse-error rate; GLM default stays accuracy-first) |
+| `RFE_JUDGE_FALLBACK_MODEL`     | provider preset                      | generic fallback judge model id — use this for non-synthetic id shapes |
 | `SYNTHETIC_API_KEY`            | —                                    | key for `https://api.synthetic.new/v1` |
 | `OPENROUTER_API_KEY`           | —                                    | key for `https://openrouter.ai/api/v1` |
-| `RFE_SYNTHETIC_GLM_MODEL`      | `hf:zai-org/GLM-5.3-Flash`           | synthetic preset GLM judge model id |
-| `RFE_SYNTHETIC_DEEPSEEK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | synthetic preset DeepSeek judge model id |
-| `RFE_OPENROUTER_GLM_MODEL`     | `z-ai/glm-5.3-flash`                 | openrouter preset GLM judge model id |
-| `RFE_OPENROUTER_DEEPSEEK_MODEL`| `deepseek/deepseek-v4.1-flash`       | openrouter preset DeepSeek judge model id |
+| `RFE_SYNTHETIC_MAIN_MODEL`      | `hf:zai-org/GLM-5.3-Flash`           | synthetic preset main judge model id |
+| `RFE_SYNTHETIC_FALLBACK_MODEL` | `hf:deepseek-ai/DeepSeek-V4.1-Flash` | synthetic preset fallback judge model id |
+| `RFE_OPENROUTER_MAIN_MODEL`     | `z-ai/glm-5.3-flash`                 | openrouter preset main judge model id |
+| `RFE_OPENROUTER_FALLBACK_MODEL`| `deepseek/deepseek-v4.1-flash`       | openrouter preset fallback judge model id |
 | `RFE_ACTIVE_MODEL`             | auto-detect                          | override active-model detection |
 | `RFE_PREMISE_TOOLS`            | `read\|fetch\|web\|doc\|search`       | regex (case-insensitive) for premise-capture tool names |
 | `RFE_PREMISE_CAP`              | `24000`                              | max chars kept in premise buffer (most recent) |
@@ -149,8 +149,8 @@ defaults. Example — judge with any OpenAI-compatible endpoint:
 export RFE_JUDGE_PROVIDER=my-endpoint        # preset name is free-form
 export RFE_JUDGE_BASE_URL=https://llm.internal/v1
 export RFE_JUDGE_API_KEY=...
-export RFE_JUDGE_GLM_MODEL=openai/gpt-oss-120b
-export RFE_JUDGE_DEEPSEEK_MODEL=mistral/magistral-small
+export RFE_JUDGE_MAIN_MODEL=openai/gpt-oss-120b
+export RFE_JUDGE_FALLBACK_MODEL=mistral/magistral-small
 ```
 
 ## Cost notes
