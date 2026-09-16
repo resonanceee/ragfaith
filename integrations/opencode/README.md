@@ -56,7 +56,8 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    `.aws/credentials`) are never captured, and secret-looking strings are
    redacted before storage (see Privacy below).
 2. **Doc-pull check** (free, deterministic) — on `tool.execute.before`, if a
-   package is invoked (npm/bun/pip install args, import/require tokens) without
+   package is invoked (npm/bun/pnpm/yarn/pip install args — `install`, `i`,
+   and `add` aliases all match — plus import/require tokens) without
    a fetched-docs premise mentioning it, a non-blocking toast warns:
    "doc-pull check: X used without fetched docs". Advisory only, never blocks.
 3. **Active model detection** — captured from `chat.params` /
@@ -136,6 +137,8 @@ agent reads.
 | `RFE_OPENROUTER_MAIN_MODEL`     | `z-ai/glm-5.3-flash`                 | openrouter preset main judge model id |
 | `RFE_OPENROUTER_FALLBACK_MODEL`| `deepseek/deepseek-v4.1-flash`       | openrouter preset fallback judge model id |
 | `RFE_ACTIVE_MODEL`             | auto-detect                          | override active-model detection |
+| `RFE_STRICTNESS`               | `normal`                             | `normal` = flag `unfaithful` only; `strict` = flag both verdicts + provenance arm in the nudge |
+| `RFE_FLAG_VERDICTS`            | unset                                 | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable`); explicit CSV wins over `RFE_STRICTNESS` |
 | `RFE_PREMISE_TOOLS`            | `read\|fetch\|web\|doc\|search`       | regex (case-insensitive) for premise-capture tool names |
 | `RFE_PREMISE_CAP`              | `24000`                              | max chars kept in premise buffer (most recent) |
 | `RFE_MAX_CLAIMS`               | `50`                                 | max claims judged per reply (rest skipped + logged) |

@@ -29,8 +29,12 @@ Tests (no network): `pip install .[dev] && pytest -q`
 The proxy holds **no API key of its own**. Every client request must carry its
 own `Authorization: Bearer <provider key>` header, which the proxy forwards to
 the upstream verbatim. The client's token also authenticates the judge calls
-that request's cascade triggers. Requests without an `Authorization` header
-get 401. Consequence: the proxy can be hosted openly — anyone who connects
+that request's cascade triggers — with one exception: the client's upstream
+credential is only valid for judging when the judge provider is the same as
+the upstream, so with the `openrouter` judge preset the judge authenticates
+with the `OPENROUTER_API_KEY` environment variable instead (falling back to
+the client token only if it is unset). Requests without an `Authorization`
+header get 401. Consequence: the proxy can be hosted openly — anyone who connects
 needs and spends only their own provider key.
 
 ## FlowDown (reference example)
@@ -62,9 +66,10 @@ client -> proxy -> upstream LLM
 
 - **Model detection**: the request's `model` field is the active model.
 - **Judge selection** (never self-judge): the active model is compared against
-  the configured main judge model (provider prefixes and `:` variants ignored).
-  A match is judged by the configured fallback model; anything else is judged
-  by the main model. Both models are configurable for any
+  the configured main judge model (provider prefixes and `:` variants ignored;
+  an exact match or the main judge id appearing inside the active id counts
+  as a match). A match is judged by the configured fallback model; anything
+  else is judged by the main model. Both models are configurable for any
   OpenAI-compatible endpoint via `RFE_JUDGE_MAIN_MODEL` /
   `RFE_JUDGE_FALLBACK_MODEL` — no `hf:`-style id shape required.
 - **Premises**: content the conversation actually pulled — `role: "tool"`
@@ -116,10 +121,11 @@ decorator) to surface drift with the normal template. When premises exceed the
 per-claim budget, the judge is told to prefer `unverifiable` over `unfaithful`
 so premise filtering/truncation can't read as fabrication.
 
-Stream timing: in `chain` mode `[DONE]` is withheld until the cascade has
-ruled (the correction appends to the same stream). In `next` mode — and for
-faithful replies in any mode — the stream closes immediately after the
-upstream reply and the cascade runs in the background.
+Stream timing: only `chain` mode needs `[DONE]` withheld (it may append the
+self-correction to the same stream), so the client waits for the cascade to
+rule before the stream closes — faithful or not. Every other mode flushes
+`[DONE]` immediately after the upstream reply so the spinner stops on time,
+and the cascade runs in the background.
 
 Auditability: `RFE_JUDGE_LOG` rows include the claim text, verdict, verdict
 cache key, and conversation id; nudge stash/delivery events are logged
@@ -156,6 +162,7 @@ conversation and reconcile; do not invent corrections.
 | `RFE_OPENROUTER_BASE` | `https://openrouter.ai/api/v1` | Judge base URL (openrouter preset) |
 | `RFE_OPENROUTER_MAIN_MODEL` | `z-ai/glm-5.3-flash` | OpenRouter main judge |
 | `RFE_OPENROUTER_FALLBACK_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter fallback judge |
+| `OPENROUTER_API_KEY` | — | Judge auth when `RFE_JUDGE_PROVIDER=openrouter` (client token is upstream-only; used as fallback if unset) |
 | `RFE_NUDGE_MODE` | `chain` | `chain`, `next`, or `regen` |
 | `RFE_NUDGE_TEMPLATE` | chain/next template | Override the visible nudge text |
 | `RFE_REGEN_NUDGE` | directive template | Override the regen-mode internal nudge |
