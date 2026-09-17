@@ -8,7 +8,7 @@ We built an evaluation arena for faithfulness judges and compared a range of app
 
 The evaluation uses 18,900 English claims from RAGTruth, 800 synthetic German and Italian cases, 600 organic real world answers, and two rounds of human adjudication.
 
-The winning judge is not just a benchmark result. You can run it as a live guardrail on real conversations through two published integrations: the [ragfaith-proxy](https://pypi.org/project/ragfaith-proxy/) Python package, an OpenAI compatible sidecar for any client, and the [@resonanceee/opencode-ragfaith](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) npm package, a plugin for opencode sessions. Both are described in the [Integrations](#integrations) section below.
+The winning judge is not just a benchmark result. You can run it as a live guardrail on real conversations through three published integrations: the [ragfaith-proxy](https://pypi.org/project/ragfaith-proxy/) Python package, an OpenAI compatible sidecar for any client, the [@resonanceee/opencode-ragfaith](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) npm package, a plugin for opencode sessions, and the [ragfaith-mcp](https://pypi.org/project/ragfaith-mcp/) Python package, an MCP server exposing `check_faithfulness` to any MCP-capable host. All three are described in the [Integrations](#integrations) section below.
 
 ## The main result
 
