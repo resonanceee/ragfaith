@@ -139,7 +139,8 @@ agent reads.
 | `RFE_ACTIVE_MODEL`             | auto-detect                          | override active-model detection |
 | `RFE_STRICTNESS`               | `normal`                             | `normal` = flag `unfaithful` only; `strict` = flag both verdicts + provenance arm in the nudge |
 | `RFE_FLAG_VERDICTS`            | unset                                 | CSV of verdicts that trigger a nudge (e.g. `unfaithful,unverifiable`); explicit CSV wins over `RFE_STRICTNESS` |
-| `RFE_PREMISE_TOOLS`            | `read\|fetch\|web\|doc\|search`       | regex (case-insensitive) for premise-capture tool names |
+| `RFE_EVIDENCE_SCOPE`           | `web`                                 | evidence thoroughness: `web` = web fetches/searches + file reads; `all` = additionally command-execution output (bash, exec, shell, …). An explicit `RFE_PREMISE_TOOLS` regex wins over both presets. Premises from on-machine tools (reads, commands) are judged with the inference-tolerant machine prompt; web premises with the standard prompt. |
+| `RFE_PREMISE_TOOLS`            | `read\|fetch\|web\|doc\|search`       | regex (case-insensitive) for premise-capture tool names (overrides `RFE_EVIDENCE_SCOPE`) |
 | `RFE_PREMISE_CAP`              | `24000`                              | max chars kept in premise buffer (most recent) |
 | `RFE_MAX_CLAIMS`               | `50`                                 | max claims judged per reply (rest skipped + logged) |
 | `RFE_CACHE_DIR`                | unset (memory-only)                  | persistent verdict cache directory |

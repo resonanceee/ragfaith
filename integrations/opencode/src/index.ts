@@ -14,7 +14,7 @@ export const VERDICTS = ["faithful", "unfaithful", "unverifiable"] as const;
 export type Verdict = (typeof VERDICTS)[number];
 
 export const SYSTEM_PROMPT =
-  "You are a RAG faithfulness judge. / Du bist ein RAG-Treuerichter.\n" +
+  "You are a RAG faithfulness judge.\n" +
   "Decide if the CLAIM is fully supported by the CONTEXT alone (never use " +
   "outside knowledge). Answer with ONLY one JSON object, no other text:\n" +
   '{"verdict": "faithful"} - every fact in the claim is supported by the context\n' +
@@ -22,11 +22,35 @@ export const SYSTEM_PROMPT =
   "by the context (wrong entity, number, date, or fabricated detail)\n" +
   '{"verdict": "unverifiable"} - the context does not address the claim at all';
 
+export const MACHINE_SYSTEM_PROMPT =
+  "You are a RAG faithfulness judge.\n" +
+  "The CONTEXT contains material the assistant inspected on this machine " +
+  "(file contents, command output, directory listings, test results). The " +
+  "CLAIM may be a plausible inference drawn from that material rather than " +
+  "a restatement of it. Answer with ONLY one JSON object, no other text:\n" +
+  '{"verdict": "faithful"} - a reasonable person reading the CONTEXT could ' +
+  "reach the claim from it, even if the claim paraphrases, summarizes, or " +
+  "infers beyond the literal text without contradicting it\n" +
+  '{"verdict": "unfaithful"} - the claim contradicts the CONTEXT, or asserts ' +
+  "a specific fact (entity, number, path, version, date) the inspected " +
+  "material does not support (fabricated detail)\n" +
+  '{"verdict": "unverifiable"} - the CONTEXT does not address the claim at all';
+
 const VERDICT_RE = /"verdict"\s*:\s*"(\w+)"/;
 const DEFAULT_PREMISE_CAP = 24_000;
 const DEFAULT_PREMISE_TOOLS = "read|fetch|web|doc|search";
+const COMMAND_TOOLS = "bash|exec|shell|terminal|run|command";
 const DEFAULT_MAX_CLAIMS = 50;
 const PACKAGE_RE = /@?[a-z0-9][a-z0-9._\/-]*/gi;
+
+export type PremiseSource = "web" | "machine";
+export interface Premise {
+  text: string;
+  source: PremiseSource;
+}
+
+const MACHINE_TOOL_RE =
+  /read|grep|glob|bash|exec|shell|terminal|run|command|node|python|dir|list/i;
 
 // ---------------------------------------------------------------------------
 // privacy: sensitive paths + secret redaction (no deps, applied before store)
@@ -106,12 +130,20 @@ export function resolveProvider(
 function premiseToolsRegex(
   env: Record<string, string | undefined> = process.env,
 ): RegExp {
-  const src = env["RFE_PREMISE_TOOLS"] ?? DEFAULT_PREMISE_TOOLS;
-  try {
-    return new RegExp(src, "i");
-  } catch {
-    return new RegExp(DEFAULT_PREMISE_TOOLS, "i");
+  const custom = env["RFE_PREMISE_TOOLS"];
+  if (custom) {
+    try {
+      return new RegExp(custom, "i");
+    } catch {
+      /* fall through to scope-based default */
+    }
   }
+  const scope = (env["RFE_EVIDENCE_SCOPE"] ?? "").trim().toLowerCase();
+  const src =
+    scope === "all"
+      ? `${DEFAULT_PREMISE_TOOLS}|${COMMAND_TOOLS}`
+      : DEFAULT_PREMISE_TOOLS;
+  return new RegExp(src, "i");
 }
 
 function premiseCap(
@@ -179,22 +211,47 @@ function claimTokens(text: string): Set<string> {
   return out;
 }
 
+/** Source tag for the evidence a claim most leans on: highest lexical overlap
+ *  wins; ties and the no-token case favor the most recently captured premise. */
+function bestSource(
+  premises: Premise[],
+  claimToks: Set<string>,
+): PremiseSource {
+  let best: { score: number; source: PremiseSource } | undefined;
+  for (let i = premises.length - 1; i >= 0; i--) {
+    const p = premises[i]!;
+    const toks = claimTokens(p.text);
+    let score = 0;
+    for (const t of claimToks) if (toks.has(t)) score++;
+    if (!best || score > best.score) best = { score, source: p.source };
+  }
+  return best?.source ?? "web";
+}
+
 /** Most relevant premise passages for one claim, within `budget` chars
  *  (lexical overlap, no embeddings). Oversized relevant passages are
  *  head-truncated to the remaining room; with no overlap at all, the most
- *  recent `fallback` chars are sent so the judge can answer unverifiable. */
+ *  recent `fallback` chars are sent so the judge can answer unverifiable.
+ *  The returned source tags the dominant evidence origin (web vs machine)
+ *  and selects the judge prompt variant. */
 export function selectPremise(
-  premises: string,
+  premises: Premise[],
   claim: string,
   budget = DEFAULT_PREMISE_BUDGET,
   fallback = DEFAULT_PREMISE_FALLBACK,
-): string {
-  if (premises.length <= budget) return premises;
+): { text: string; source: PremiseSource } {
+  const joined = premises.map((p) => p.text).join("\n\n");
+  if (joined.length <= budget) {
+    return { text: joined, source: bestSource(premises, claimTokens(claim)) };
+  }
   const claimToks = claimTokens(claim);
-  if (claimToks.size === 0) return premises.slice(-fallback);
-  const passages = premises.split("\n\n");
-  const scored = passages.map((p, i) => {
-    const toks = claimTokens(p);
+  const recentSource = (): PremiseSource =>
+    premises[premises.length - 1]?.source ?? "web";
+  if (claimToks.size === 0) {
+    return { text: joined.slice(-fallback), source: recentSource() };
+  }
+  const scored = premises.map((p, i) => {
+    const toks = claimTokens(p.text);
     let score = 0;
     for (const t of claimToks) if (toks.has(t)) score++;
     return { score, i, p };
@@ -205,13 +262,18 @@ export function selectPremise(
   for (const s of scored) {
     if (s.score <= 0 || used >= budget) continue;
     const room = budget - used;
-    const text = s.p.length <= room ? s.p : s.p.slice(0, room);
+    const text = s.p.text.length <= room ? s.p.text : s.p.text.slice(0, room);
     picked.push({ i: s.i, text });
     used += text.length + 2;
   }
-  if (picked.length === 0) return premises.slice(-fallback);
+  if (picked.length === 0) {
+    return { text: joined.slice(-fallback), source: recentSource() };
+  }
   picked.sort((a, b) => a.i - b.i);
-  return picked.map((p) => p.text).join("\n\n");
+  return {
+    text: picked.map((p) => p.text).join("\n\n"),
+    source: scored[0]!.p.source,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -350,9 +412,14 @@ export function parseVerdict(text: string): Verdict {
 // verdict key + cache (port of llm_judge._verdict_key / JSONL store)
 // ---------------------------------------------------------------------------
 
-export function verdictKey(model: string, context: string, claim: string): string {
+export function verdictKey(
+  model: string,
+  variant: string,
+  context: string,
+  claim: string,
+): string {
   return createHash("sha256")
-    .update(`${model}\x00${context}\x00${claim}`)
+    .update(`${model}\x00${variant}\x00${context}\x00${claim}`)
     .digest("hex");
 }
 
@@ -492,14 +559,21 @@ export class Judge {
     this.checkpoint = opts.model;
   }
 
-  private async call(userMsg: string, maxTokens: number): Promise<ChatResp> {
+  private async call(
+    userMsg: string,
+    maxTokens: number,
+    variant: PremiseSource,
+  ): Promise<ChatResp> {
     const body = JSON.stringify({
       model: this.checkpoint,
       temperature: 0,
       max_tokens: maxTokens,
       reasoning: { exclude: true }, // hide reasoning; still billed ~100-250 tok
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "system",
+          content: variant === "machine" ? MACHINE_SYSTEM_PROMPT : SYSTEM_PROMPT,
+        },
         { role: "user", content: userMsg },
       ],
     });
@@ -559,8 +633,12 @@ export class Judge {
   }
 
   /** Judge one claim against context. Never throws; fallback = unverifiable. */
-  async verdict(context: string, claim: string): Promise<Verdict> {
-    const key = verdictKey(this.checkpoint, context, claim);
+  async verdict(
+    context: string,
+    claim: string,
+    variant: PremiseSource = "web",
+  ): Promise<Verdict> {
+    const key = verdictKey(this.checkpoint, variant, context, claim);
     const hit = this.o.cache?.get(key);
     if (hit) return hit;
     let verdict: Verdict = "unverifiable";
@@ -570,7 +648,7 @@ export class Judge {
       let retryPrompt = 0;
       let retryCompletion = 0;
       for (const maxTokens of [this.o.maxTokens, this.o.maxTokens * 2]) {
-        const resp = await this.call(msg, maxTokens);
+        const resp = await this.call(msg, maxTokens, variant);
         this.account(resp, context.length);
         retryPrompt += resp.usage?.prompt_tokens ?? 0;
         retryCompletion += resp.usage?.completion_tokens ?? 0;
@@ -615,19 +693,26 @@ export class Judge {
 // ---------------------------------------------------------------------------
 
 export class PremiseStore {
-  private buf = "";
+  private entries: Premise[] = [];
   constructor(private readonly cap = DEFAULT_PREMISE_CAP) {}
 
-  append(text: string): void {
-    this.buf = (this.buf + "\n" + text).slice(-this.cap);
+  append(text: string, source: PremiseSource): void {
+    this.entries.push({ text: text.slice(0, this.cap), source });
+    while (this.entries.length > 1 && this.length > this.cap) {
+      this.entries.shift();
+    }
+  }
+
+  get all(): Premise[] {
+    return this.entries;
   }
 
   get text(): string {
-    return this.buf;
+    return this.entries.map((e) => e.text).join("\n\n");
   }
 
   get length(): number {
-    return this.buf.length;
+    return this.entries.reduce((n, e) => n + e.text.length, 0);
   }
 }
 
@@ -811,14 +896,14 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
       const allowed = flagVerdicts();
       const flagged: FlaggedClaim[] = [];
       for (const claim of kept) {
-        const sel = selectPremise(context, claim);
+        const sel = selectPremise(st.premises.all, claim);
         // premise filtering dropped content: prefer the conservative label so
         // truncation can't read as fabrication (issue #86)
         const ctx =
-          context.length > DEFAULT_PREMISE_BUDGET
-            ? sel + TRUNCATION_NOTE
-            : sel;
-        const v = await judge.verdict(ctx, claim);
+          st.premises.length > DEFAULT_PREMISE_BUDGET
+            ? sel.text + TRUNCATION_NOTE
+            : sel.text;
+        const v = await judge.verdict(ctx, claim, sel.source);
         if (v !== "faithful" && allowed.includes(v)) {
           flagged.push({ claim, verdict: v });
         }
@@ -902,7 +987,10 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         if (!text) return;
         const safe = redactSecrets(text);
         const st = stateOf(input.sessionID);
-        st.premises.append(safe);
+        st.premises.append(
+          safe,
+          MACHINE_TOOL_RE.test(input.tool) ? "machine" : "web",
+        );
         for (const t of extractDocTokens(safe)) st.docTokens.add(t);
       } catch (e) {
         logErr("premise-capture", e, logFile);
