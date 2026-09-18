@@ -22,6 +22,8 @@ import {
   redactSecrets,
   maxClaims,
   selectPremise,
+  SYSTEM_PROMPT,
+  MACHINE_SYSTEM_PROMPT,
   RagfaithPlugin,
   logLine,
 } from "../src/index";
@@ -432,14 +434,14 @@ describe("cache", () => {
     const file = join(dir, "opencode-cache-test_glm-judge.jsonl");
     expect(existsSync(file)).toBe(true);
     const row = JSON.parse(readFileSync(file, "utf8").trim());
-    expect(row.key).toBe(verdictKey(GLM, "ctx", "claim"));
+    expect(row.key).toBe(verdictKey(GLM, "web", "ctx", "claim"));
     expect(row.verdict).toBe("faithful");
   });
 
   test("unset -> memory only", async () => {
     delete process.env["RFE_CACHE_DIR"];
     const cache = makeCache(GLM);
-    const key = verdictKey(GLM, "a", "b");
+    const key = verdictKey(GLM, "web", "a", "b");
     cache.store(key, "faithful");
     expect(cache.get(key)).toBe("faithful");
     expect(existsSync(join(dir, "nothing.jsonl"))).toBe(false);
@@ -460,7 +462,7 @@ describe("cache", () => {
       sleepImpl: noSleep,
     });
     expect(await judge.verdict("ctx", "claim")).toBe("unverifiable");
-    expect(cache.get(verdictKey(GLM, "ctx", "claim"))).toBeUndefined();
+    expect(cache.get(verdictKey(GLM, "web", "ctx", "claim"))).toBeUndefined();
     expect(judge.callFailures).toBe(1);
     expect(judge.parseErrors).toBe(0);
   });
@@ -490,7 +492,7 @@ describe("cache", () => {
 
   test("registry memoizes cache per judge model (no re-read)", () => {
     process.env["RFE_CACHE_DIR"] = dir;
-    const key = verdictKey(GLM, "a", "b");
+    const key = verdictKey(GLM, "web", "a", "b");
     const file = join(dir, "opencode-cache-test_glm-judge.jsonl");
     writeFileSync(file, JSON.stringify({ key, verdict: "faithful" }) + "\n");
     const registry = makeCacheRegistry();
@@ -598,22 +600,49 @@ describe("claim cap", () => {
 });
 
 describe("premise cap", () => {
-  test("30k chars in -> most recent 24k retained", () => {
+  test("oversized single entry head-truncated; eviction drops whole oldest entries", () => {
     const p = new PremiseStore(24_000);
-    p.append("x".repeat(30_000));
+    p.append("x".repeat(30_000), "web");
     expect(p.length).toBe(24_000);
-    p.append("A".repeat(10_000));
-    p.append("B".repeat(20_000));
-    expect(p.length).toBe(24_000);
-    expect(p.text.startsWith("A".repeat(4000 - 1))).toBe(true); // older tail kept
-    expect(p.text.endsWith("B".repeat(20_000))).toBe(true); // newest kept
+    p.append("A".repeat(10_000), "web");
+    p.append("B".repeat(20_000), "web");
+    expect(p.length).toBe(20_000);
+    expect(p.text).toBe("B".repeat(20_000));
+  });
+
+  test("entries keep provenance tags", () => {
+    const p = new PremiseStore(24_000);
+    p.append("web doc text", "web");
+    p.append("file contents", "machine");
+    expect(p.all.map((e) => e.source)).toEqual(["web", "machine"]);
+    expect(p.text).toBe("web doc text\n\nfile contents");
   });
 });
 
 describe("premise selection (issue 82)", () => {
+  const wrap = (s: string) =>
+    s.split("\n\n").map((text) => ({ text, source: "web" as const }));
+
   test("short blob returned whole", () => {
     const src = "Alpha is A.\n\nBeta is B.";
-    expect(selectPremise(src, "What is Alpha?")).toBe(src);
+    const sel = selectPremise(wrap(src), "What is Alpha?");
+    expect(sel.text).toBe(src);
+    expect(sel.source).toBe("web");
+  });
+
+  test("source follows top-overlap entry; ties favor most recent", () => {
+    const sel = selectPremise(
+      [
+        { text: "Beta is B.", source: "web" },
+        { text: "Alpha is set to one.", source: "machine" },
+      ],
+      "What is Alpha?",
+    );
+    expect(sel.source).toBe("machine");
+  });
+
+  test("empty store falls back to web variant", () => {
+    expect(selectPremise([], "Any claim?").source).toBe("web");
   });
 
   test("relevant passage kept, filler dropped, within budget", () => {
@@ -624,25 +653,25 @@ describe("premise selection (issue 82)", () => {
     const relevant = "Alpha concentration measured in serum samples was elevated.";
     passages[3] = relevant;
     const src = passages.join("\n\n");
-    const out = selectPremise(src, "Was the Alpha concentration elevated?");
-    expect(out).toContain(relevant);
-    expect(out).not.toContain("Filler document number 19");
-    expect(out.length).toBeLessThanOrEqual(12_000);
+    const out = selectPremise(wrap(src), "Was the Alpha concentration elevated?");
+    expect(out.text).toContain(relevant);
+    expect(out.text).not.toContain("Filler document number 19");
+    expect(out.text.length).toBeLessThanOrEqual(12_000);
   });
 
   test("oversized relevant passage head-truncated", () => {
     const src = ["zz".repeat(50), `Alpha serum levels rose sharply. ${"q".repeat(20000)}`].join(
       "\n\n",
     );
-    const out = selectPremise(src, "Did Alpha serum levels rise?");
-    expect(out.startsWith("Alpha serum levels rose sharply.")).toBe(true);
-    expect(out.length).toBeLessThanOrEqual(12_000);
+    const out = selectPremise(wrap(src), "Did Alpha serum levels rise?");
+    expect(out.text.startsWith("Alpha serum levels rose sharply.")).toBe(true);
+    expect(out.text.length).toBeLessThanOrEqual(12_000);
   });
 
   test("no overlap falls back to most recent chars", () => {
     const src = Array.from({ length: 10 }, (_, i) => `${String(i).padStart(2, "0")} ${"z".repeat(2000)}`).join("\n\n");
-    const out = selectPremise(src, "Completely unrelated xylophone question?");
-    expect(out).toBe(src.slice(-4000));
+    const out = selectPremise(wrap(src), "Completely unrelated xylophone question?");
+    expect(out.text).toBe(src.slice(-4000));
   });
 });
 
@@ -669,6 +698,49 @@ describe("nudge aggregation", () => {
   test("unfaithful-only nudge has no provenance arm", () => {
     const nudge = buildNudge(GLM, [{ claim: "Sky is green.", verdict: "unfaithful" }]);
     expect(nudge).not.toContain("internal (training) knowledge");
+  });
+});
+
+describe("judge prompt variants", () => {
+  test("German line stripped from both prompts", () => {
+    expect(SYSTEM_PROMPT).not.toContain("Du bist");
+    expect(MACHINE_SYSTEM_PROMPT).not.toContain("Du bist");
+  });
+
+  test("machine prompt names on-machine material, tolerates inference, guards fabrication", () => {
+    expect(MACHINE_SYSTEM_PROMPT).toContain("inspected on this machine");
+    expect(MACHINE_SYSTEM_PROMPT).toContain("plausible inference");
+    expect(MACHINE_SYSTEM_PROMPT).toContain("fabricated detail");
+  });
+
+  test("cache key separates prompt variants", () => {
+    expect(verdictKey(GLM, "machine", "c", "l")).not.toBe(
+      verdictKey(GLM, "web", "c", "l"),
+    );
+  });
+
+  test("judge sends the variant-matching system prompt", async () => {
+    const bodies: string[] = [];
+    const judge = new Judge({
+      baseUrl: "https://x.test",
+      apiKey: "k",
+      model: GLM,
+      session: "s",
+      fetchImpl: (async (_u: unknown, init: { body?: string }) => {
+        bodies.push(String(init?.body ?? ""));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => okResp("faithful"),
+        } as Response;
+      }) as unknown as typeof fetch,
+      sleepImpl: noSleep,
+    });
+    await judge.verdict("ctx", "one", "machine");
+    await judge.verdict("ctx", "two", "web");
+    expect(bodies.length).toBe(2);
+    expect(JSON.parse(bodies[0]!).messages[0].content).toBe(MACHINE_SYSTEM_PROMPT);
+    expect(JSON.parse(bodies[1]!).messages[0].content).toBe(SYSTEM_PROMPT);
   });
 });
 
@@ -783,6 +855,47 @@ describe("plugin hooks", () => {
       { client: c.client } as unknown as Parameters<typeof RagfaithPlugin>[0],
     );
     return { ...c, hooks };
+  }
+
+  type Hooks = Awaited<ReturnType<typeof pluginHooks>>["hooks"];
+
+  async function reply(
+    hooks: Hooks,
+    sessionID: string,
+    messageID: string,
+    text: string,
+  ): Promise<void> {
+    await hooks.event!({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: { id: `p-${messageID}`, sessionID, messageID, type: "text", text },
+        },
+      } as unknown as Event,
+    });
+    await hooks.event!({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: messageID,
+            sessionID,
+            role: "assistant",
+            time: { completed: 1 },
+            modelID: "m",
+            providerID: "p",
+            parentID: "u1",
+          },
+        },
+      } as unknown as Event,
+    });
+  }
+
+  function judgeFetch(capture: (body: string) => void): typeof fetch {
+    return (async (_url: unknown, init: { body?: string }) => {
+      capture(String(init?.body ?? ""));
+      return { ok: true, status: 200, json: async () => okResp("faithful") } as Response;
+    }) as unknown as typeof fetch;
   }
 
   test("session.deleted drops session state", async () => {
@@ -961,6 +1074,133 @@ describe("plugin hooks", () => {
       globalThis.fetch = origFetch;
       delete process.env["SYNTHETIC_API_KEY"];
       delete process.env["RFE_MAX_CLAIMS"];
+    }
+  });
+
+  test("default scope: command output not captured -> no judge call", async () => {
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => okResp("faithful") } as Response;
+    }) as unknown as typeof fetch;
+    try {
+      await hooks["tool.execute.after"]!(
+        { tool: "bash", sessionID: "s10", callID: "c1", args: { command: "bun test" } },
+        { title: "bash", output: "42 tests pass", metadata: {} },
+      );
+      await reply(hooks, "s10", "m1", "One claim.");
+      await Bun.sleep(50);
+      expect(calls).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("RFE_EVIDENCE_SCOPE=all: command output judged with machine prompt", async () => {
+    process.env["RFE_EVIDENCE_SCOPE"] = "all";
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    let sent = "";
+    globalThis.fetch = judgeFetch((b) => {
+      sent = b;
+    });
+    try {
+      await hooks["tool.execute.after"]!(
+        { tool: "bash", sessionID: "s11", callID: "c1", args: { command: "bun run demo.ts" } },
+        { title: "bash", output: "42 tests pass", metadata: {} },
+      );
+      await reply(hooks, "s11", "m1", "One claim.");
+      for (let i = 0; i < 100 && !sent; i++) await Bun.sleep(5);
+      const body = JSON.parse(sent);
+      expect(body.messages[0].content).toBe(MACHINE_SYSTEM_PROMPT);
+      expect(sent).toContain("42 tests pass");
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+      delete process.env["RFE_EVIDENCE_SCOPE"];
+    }
+  });
+
+  test("webfetch premise keeps the standard prompt", async () => {
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let sent = "";
+    globalThis.fetch = judgeFetch((b) => {
+      sent = b;
+    });
+    try {
+      await hooks["tool.execute.after"]!(
+        { tool: "webfetch", sessionID: "s12", callID: "c1", args: { url: "https://x.test/docs" } },
+        { title: "docs", output: "Default timeout is 30000 ms.", metadata: {} },
+      );
+      await reply(hooks, "s12", "m1", "The default timeout is thirty thousand ms.");
+      for (let i = 0; i < 100 && !sent; i++) await Bun.sleep(5);
+      const body = JSON.parse(sent);
+      expect(body.messages[0].content).toBe(SYSTEM_PROMPT);
+      expect(sent).toContain("30000");
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("read premise uses the machine prompt in default mode", async () => {
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let sent = "";
+    globalThis.fetch = judgeFetch((b) => {
+      sent = b;
+    });
+    try {
+      await hooks["tool.execute.after"]!(
+        { tool: "read", sessionID: "s13", callID: "c1", args: { filePath: "/src/a.ts" } },
+        { title: "a", output: "const timeout = 5000;", metadata: {} },
+      );
+      await reply(hooks, "s13", "m1", "The timeout is five seconds.");
+      for (let i = 0; i < 100 && !sent; i++) await Bun.sleep(5);
+      const body = JSON.parse(sent);
+      expect(body.messages[0].content).toBe(MACHINE_SYSTEM_PROMPT);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("explicit RFE_PREMISE_TOOLS overrides scope=all", async () => {
+    process.env["RFE_PREMISE_TOOLS"] = "webfetch";
+    process.env["RFE_EVIDENCE_SCOPE"] = "all";
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => okResp("faithful") } as Response;
+    }) as unknown as typeof fetch;
+    try {
+      await hooks["tool.execute.after"]!(
+        { tool: "bash", sessionID: "s14", callID: "c1", args: { command: "bun test" } },
+        { title: "bash", output: "42 tests pass", metadata: {} },
+      );
+      await hooks["tool.execute.after"]!(
+        { tool: "read", sessionID: "s14", callID: "c2", args: { filePath: "/src/a.ts" } },
+        { title: "a", output: "const x = 1;", metadata: {} },
+      );
+      await reply(hooks, "s14", "m1", "One claim.");
+      await Bun.sleep(50);
+      expect(calls).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+      delete process.env["RFE_PREMISE_TOOLS"];
+      delete process.env["RFE_EVIDENCE_SCOPE"];
     }
   });
 });
