@@ -1,6 +1,6 @@
 {
   "name": "@resonanceee/opencode-ragfaith",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "opencode plugin: live faithfulness cascade (ragfaith)",
   "type": "module",
   "main": "src/index.ts",
@@ -14,9 +14,6 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
-  },
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.30",
