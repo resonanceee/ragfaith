@@ -13,6 +13,12 @@ aggregated nudge injected back into the session. Faithful replies are silent.
 npm install @resonanceee/opencode-ragfaith
 ```
 
+Zero runtime dependencies — the package ships as a single self-contained TS
+file (type-only imports are erased when opencode loads it), so nothing besides
+the plugin itself is installed. It targets the opencode v1 plugin API
+(`@opencode-ai/plugin` `>=1.0.0`, tested against 1.18.x); compatibility is
+covered by the host, not by npm, since no peer dependency is declared.
+
 Registry pages: [npmjs](https://www.npmjs.com/package/@resonanceee/opencode-ragfaith) ·
 [GitHub Packages](https://github.com/resonanceee/ragfaith/pkgs/npm/opencode-ragfaith)
 
