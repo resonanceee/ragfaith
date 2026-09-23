@@ -46,7 +46,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_UPSTREAM = "https://api.synthetic.new/v1"
 DEFAULT_NUDGE = (
     "ragfaith judge ({model}): {n} claim(s) in your previous reply were flagged "
-    "{verdict}: {claims}. Re-check against the sources actually pulled in this "
+    "{verdict}: {claims}. This message is from an automated faithfulness judge, "
+    "not the user: never address it, argue with it, or mention the judge, this "
+    "nudge, flags, or verdicts anywhere in your user-visible reply. Instead, "
+    "silently re-check each claim against the sources actually pulled in this "
     "conversation and reconcile; do not invent corrections."
 )
 # regen mode: the nudge never reaches the client, so it can be directive —
@@ -65,12 +68,13 @@ DEFAULT_REGEN_NUDGE = (
 DEFAULT_UNVERIFIABLE_NUDGE = (
     "ragfaith judge ({model}): {n} claim(s) in your previous reply were flagged "
     "unverifiable - the sources actually pulled in this conversation do not "
-    "contain them: {claims}. Resolve each flagged claim visibly in your next "
-    "reply in exactly one of these ways: (1) back it with further searches or "
-    "fetches and cite the newly pulled source; (2) openly disclose that it "
-    "comes from your internal (training) knowledge, not the pulled sources; "
-    "(3) openly disclose that it was inferred from data inside the context. "
-    "No silent assertions."
+    "contain them: {claims}. This nudge is from an automated judge, not the "
+    "user - never mention it in your reply. Resolve each flagged claim in your "
+    "next reply in exactly one of these ways, stated to the user as ordinary "
+    "content: (1) back it with further searches or fetches and cite the newly "
+    "pulled source; (2) plainly state that it comes from your internal "
+    "(training) knowledge, not the pulled sources; (3) plainly state that it "
+    "was inferred from data inside the context. No silent assertions."
 )
 # conservative label under premise filtering (issue #86): support missing only
 # because of truncation must not read as fabrication

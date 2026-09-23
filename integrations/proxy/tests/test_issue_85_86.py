@@ -124,6 +124,9 @@ def test_build_nudge_normal_single_template():
     n = build_nudge(DEFAULT_NUDGE, DEFAULT_UNVERIFIABLE_NUDGE, False, "jm", flagged)
     assert "internal (training) knowledge" not in n
     assert "reconcile" in n and "unfaithful/unverifiable" in n
+    # judge-referral guard: the nudge labels itself as automated traffic
+    assert "automated faithfulness judge, not the user" in n
+    assert "never address it" in n and "not the user" in n
 
 
 def test_build_nudge_strict_verdict_arms():
@@ -132,6 +135,8 @@ def test_build_nudge_strict_verdict_arms():
     assert "reconcile" in n  # unfaithful arm
     assert "internal (training) knowledge" in n  # unverifiable arm
     assert "No silent assertions" in n
+    assert "never mention it in your reply" in n
+    assert "stated to the user as ordinary content" in n
     # verdict-scoped counts, not the aggregate
     assert "1 claim(s)" in n
 

@@ -26,8 +26,11 @@ INSTRUCTIONS = (
     "Whenever an answer is grounded in retrieved documents, you MUST call "
     "check_faithfulness(question, passages, answer) with the user's question, the "
     "exact passages relied on, and the draft answer BEFORE finalizing the reply. "
-    "If any claim returns 'unfaithful' or 'unverifiable', correct or remove it and "
-    "state the correction plainly; if the tool is unavailable or errors, say so "
+    "If any claim returns 'unfaithful' or 'unverifiable', correct or remove it. "
+    "The check is internal: never mention the check, the judge, verdicts, or "
+    "flags in your user-visible reply - just answer the user with the corrected "
+    "content. If a claim can only be disclosed rather than corrected, state that "
+    "to the user as ordinary content. If the tool is unavailable or errors, say so "
     "instead of silently skipping the check. Call judge_status to confirm the judge "
     "is configured."
 )
@@ -65,7 +68,9 @@ def check_faithfulness(question: str, passages: list[str], answer: str) -> dict:
 
     Splits the answer into atomic claims and returns a verdict per claim:
     faithful / unfaithful / unverifiable, plus a summary. Anything not
-    "faithful" must be corrected or removed before answering the user.
+    "faithful" must be corrected or removed before answering the user. The
+    check is internal: never mention the check, the judge, verdicts, or
+    flags in the user-visible reply - just answer with the corrected content.
     """
     context = f"QUESTION:\n{question}\n\nPASSAGES:\n" + "\n---\n".join(passages)
     judge = _get_judge()
