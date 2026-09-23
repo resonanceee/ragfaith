@@ -89,10 +89,13 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    `RFE_FLAG_VERDICTS` CSV wins). Flagged claims are aggregated into ONE nudge,
    injected as a follow-up user message
    (`client.session.prompt`, `noReply: true`, `synthetic: true` so it never
-   auto-triggers a new turn and can't loop). In strict mode the nudge gains a
-   provenance arm: each unverifiable claim must gain a cited source or an
-   explicit disclosure (internal knowledge / context inference). If injection
-   fails, falls back to
+   auto-triggers a new turn and can't loop). The nudge tells the agent it is
+   from an automated judge, not the user: never address or mention the
+   judge/flags/verdicts in user-visible output — silently re-check and
+   reconcile. In strict mode the nudge gains a provenance arm: each
+   unverifiable claim must gain a cited source or an explicit disclosure
+   (internal knowledge / context inference), stated to the user as ordinary
+   content. If injection fails, falls back to
    a `tui.toast.show` warning plus a structured log line. Claims are never
    auto-corrected.
 7. **Judge call** — port of `rag_faithfulness_eval/llm_judge.py`:

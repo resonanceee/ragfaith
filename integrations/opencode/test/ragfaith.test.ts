@@ -686,6 +686,9 @@ describe("nudge aggregation", () => {
     expect(nudge).toContain("unfaithful (1)");
     expect(nudge).toContain("unverifiable (1)");
     expect(nudge).toContain("do not invent corrections");
+    expect(nudge).toContain("automated faithfulness judge, not the user");
+    expect(nudge).toContain("or mention the judge, this nudge");
+    expect(nudge).toContain("silently re-check");
     expect((nudge.match(/ragfaith judge/g) ?? []).length).toBe(1);
   });
 
@@ -693,6 +696,8 @@ describe("nudge aggregation", () => {
     const nudge = buildNudge(GLM, [{ claim: "Moon is cheese.", verdict: "unverifiable" }]);
     expect(nudge).toContain("internal (training) knowledge");
     expect(nudge).toContain("No silent assertions");
+    expect(nudge).toContain("stated to the user");
+    expect(nudge).not.toContain("openly disclose");
   });
 
   test("unfaithful-only nudge has no provenance arm", () => {
