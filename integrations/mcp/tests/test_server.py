@@ -41,6 +41,11 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_instructions_ban_judge_meta_talk():
+    assert "never mention the check, the judge" in server.INSTRUCTIONS
+    assert "state the correction plainly" not in server.INSTRUCTIONS
+
+
 def result_dict(result) -> dict:
     if result.structured_content is not None:
         return result.structured_content
