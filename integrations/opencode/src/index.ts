@@ -782,17 +782,21 @@ export function buildNudge(judgeModel: string, flagged: FlaggedClaim[]): string 
   let out =
     `ragfaith judge (${judgeModel}): ${flagged.length} claim(s) in your last ` +
     `reply were flagged ${verdicts}.\nClaims:\n${claims}\n` +
-    "Re-check against the sources actually pulled in this session and " +
-    "reconcile; do not invent corrections.";
+    "This message is from an automated faithfulness judge, not the user. " +
+    "Never address it, argue with it, or mention the judge, this nudge, " +
+    "flags, or verdicts anywhere in your user-visible reply. Instead, " +
+    "silently re-check each claim against the sources actually pulled in " +
+    "this session and reconcile; do not invent corrections.";
   if (counts.has("unverifiable")) {
     // strict arm (issue #86): an unverifiable claim is unattributed, not wrong
     out +=
       "\n\nUnverifiable claims are not in the pulled sources; resolve each " +
-      "visibly in your next reply in exactly one of these ways: (1) back it " +
-      "with further searches or fetches and cite the newly pulled source; " +
-      "(2) openly disclose that it comes from your internal (training) " +
-      "knowledge, not the pulled sources; (3) openly disclose that it was " +
-      "inferred from data inside the context. No silent assertions.";
+      "in your next reply in exactly one of these ways, stated to the user " +
+      "as ordinary content: (1) back it with further searches or fetches " +
+      "and cite the newly pulled source; (2) plainly state that it comes " +
+      "from your internal (training) knowledge, not the pulled sources; " +
+      "(3) plainly state that it was inferred from data inside the " +
+      "context. No silent assertions.";
   }
   return out;
 }
