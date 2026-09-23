@@ -21,6 +21,7 @@ import {
   isSensitivePath,
   redactSecrets,
   maxClaims,
+  nudgeDepthCap,
   selectPremise,
   SYSTEM_PROMPT,
   MACHINE_SYSTEM_PROMPT,
@@ -599,6 +600,15 @@ describe("claim cap", () => {
   });
 });
 
+describe("nudge depth cap", () => {
+  test("default 2; override; invalid -> default", () => {
+    expect(nudgeDepthCap({})).toBe(2);
+    expect(nudgeDepthCap({ RFE_NUDGE_DEPTH: "5" })).toBe(5);
+    expect(nudgeDepthCap({ RFE_NUDGE_DEPTH: "0" })).toBe(2);
+    expect(nudgeDepthCap({ RFE_NUDGE_DEPTH: "x" })).toBe(2);
+  });
+});
+
 describe("premise cap", () => {
   test("oversized single entry head-truncated; eviction drops whole oldest entries", () => {
     const p = new PremiseStore(24_000);
@@ -823,7 +833,11 @@ describe("hooks never throw", () => {
 describe("plugin hooks", () => {
   interface PromptCall {
     path: { id: string };
-    body: { parts: Array<{ type: string; text: string; synthetic?: boolean }> };
+    body: {
+      messageID?: string;
+      parts: Array<{ type: string; text: string; synthetic?: boolean }>;
+      noReply?: boolean;
+    };
   }
 
   function fakeClient(): {
@@ -869,6 +883,7 @@ describe("plugin hooks", () => {
     sessionID: string,
     messageID: string,
     text: string,
+    parentID = "u1",
   ): Promise<void> {
     await hooks.event!({
       event: {
@@ -889,8 +904,39 @@ describe("plugin hooks", () => {
             time: { completed: 1 },
             modelID: "m",
             providerID: "p",
-            parentID: "u1",
+            parentID,
           },
+        },
+      } as unknown as Event,
+    });
+  }
+
+  async function userMessage(
+    hooks: Hooks,
+    sessionID: string,
+    messageID: string,
+    synthetic = false,
+  ): Promise<void> {
+    await hooks.event!({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: `p-${messageID}`,
+            sessionID,
+            messageID,
+            type: "text",
+            text: "user input",
+            synthetic,
+          },
+        },
+      } as unknown as Event,
+    });
+    await hooks.event!({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: { id: messageID, sessionID, role: "user", time: { created: 1 } },
         },
       } as unknown as Event,
     });
@@ -1074,11 +1120,116 @@ describe("plugin hooks", () => {
       expect(prompts.length).toBe(1);
       const part = prompts[0]!.body.parts[0]!;
       expect(part.synthetic).toBe(true);
+      // nudge triggers an auto-turn: no noReply
+      expect(prompts[0]!.body.noReply).toBeUndefined();
       expect((part.text.match(/\[unfaithful\]/g) ?? []).length).toBe(1);
     } finally {
       globalThis.fetch = origFetch;
       delete process.env["SYNTHETIC_API_KEY"];
       delete process.env["RFE_MAX_CLAIMS"];
+    }
+  });
+
+  async function until(cond: () => boolean): Promise<void> {
+    for (let i = 0; i < 200 && !cond(); i++) await Bun.sleep(5);
+  }
+
+  async function capturePremise(hooks: Hooks, sessionID: string): Promise<void> {
+    await hooks["tool.execute.after"]!(
+      { tool: "read", sessionID, callID: "c1", args: { filePath: "/src/a.ts" } },
+      { title: "a", output: "some context", metadata: {} },
+    );
+  }
+
+  function unfaithfulFetch(calls: { n: number }): typeof fetch {
+    return (async () => {
+      calls.n++;
+      return { ok: true, status: 200, json: async () => okResp("unfaithful") } as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  test("nudge cascade: auto-turns verify up to depth cap then stop", async () => {
+    const { hooks, prompts } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    const calls = { n: 0 };
+    globalThis.fetch = unfaithfulFetch(calls);
+    try {
+      await capturePremise(hooks, "s-cascade");
+      // round 1: real user turn -> reply -> nudge #1 (depth 0 -> 1)
+      await reply(hooks, "s-cascade", "r1", "Alpha is one.");
+      await until(() => prompts.length === 1);
+      expect(prompts.length).toBe(1);
+      const n1 = prompts[0]!.body.messageID!;
+      // round 2: nudge-child reply with a FRESH claim -> nudge #2 (depth 1 -> 2)
+      await reply(hooks, "s-cascade", "r2", "Beta is two.", n1);
+      await until(() => prompts.length === 2);
+      expect(prompts.length).toBe(2);
+      const n2 = prompts[1]!.body.messageID!;
+      // round 3: depth cap reached -> reply not judged, no nudge
+      await reply(hooks, "s-cascade", "r3", "Gamma is three.", n2);
+      await Bun.sleep(60);
+      expect(prompts.length).toBe(2);
+      // only r1 and r2 reached the judge
+      expect(calls.n).toBe(2);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("nudge dedup: unfixed claim re-appearing in nudge-child reply does not re-fire", async () => {
+    const { hooks, prompts } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    const calls = { n: 0 };
+    globalThis.fetch = unfaithfulFetch(calls);
+    try {
+      await capturePremise(hooks, "s-dedup");
+      await reply(hooks, "s-dedup", "r1", "The sky is green today.");
+      await until(() => prompts.length === 1);
+      const n1 = prompts[0]!.body.messageID!;
+      // same unfixed claim in the verification round: deduped before the judge
+      await reply(hooks, "s-dedup", "r2", "The sky is green today.", n1);
+      await Bun.sleep(60);
+      expect(prompts.length).toBe(1);
+      expect(calls.n).toBe(1);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("real user message resets the cascade; synthetic user message does not", async () => {
+    const { hooks, prompts } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    process.env["RFE_NUDGE_DEPTH"] = "1";
+    const calls = { n: 0 };
+    globalThis.fetch = unfaithfulFetch(calls);
+    try {
+      await capturePremise(hooks, "s-reset");
+      await reply(hooks, "s-reset", "r1", "Alpha is one.");
+      await until(() => prompts.length === 1);
+      const n1 = prompts[0]!.body.messageID!;
+      // depth cap 1: nudge-child reply is not judged
+      await reply(hooks, "s-reset", "r2", "Beta is two.", n1);
+      await Bun.sleep(60);
+      expect(prompts.length).toBe(1);
+      // synthetic user message must not reset the cap
+      await userMessage(hooks, "s-reset", "u-syn", true);
+      await reply(hooks, "s-reset", "r3", "Gamma is three.", n1);
+      await Bun.sleep(60);
+      expect(prompts.length).toBe(1);
+      // a real user message resets: next reply judged + nudged again
+      await userMessage(hooks, "s-reset", "u-real");
+      await reply(hooks, "s-reset", "r4", "Delta is four.");
+      await until(() => prompts.length === 2);
+      expect(prompts.length).toBe(2);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+      delete process.env["RFE_NUDGE_DEPTH"];
     }
   });
 
