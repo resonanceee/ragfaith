@@ -88,8 +88,9 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    only; `RFE_STRICTNESS=strict` adds `unverifiable` (explicit
    `RFE_FLAG_VERDICTS` CSV wins). Flagged claims are aggregated into ONE nudge,
    injected as a follow-up user message
-   (`client.session.prompt`, `noReply: true`, `synthetic: true` so it never
-   auto-triggers a new turn and can't loop). The nudge tells the agent it is
+   (`client.session.prompt`, `synthetic: true`) that triggers an immediate
+   reconciliation turn — the agent acts on the nudge right away, not at the
+   next user prompt. The nudge tells the agent it is
    from an automated judge, not the user: never address or mention the
    judge/flags/verdicts in user-visible output — silently re-check and
    reconcile. In strict mode the nudge gains a provenance arm: each
@@ -98,6 +99,11 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    content. If injection fails, falls back to
    a `tui.toast.show` warning plus a structured log line. Claims are never
    auto-corrected.
+   **Cascade bound:** the nudge-child reply is judged again (verification
+   round) until `RFE_NUDGE_DEPTH` auto-rounds per user turn (default 2) are
+   used up; claims already nudged in the current turn are deduped, so an
+   unfixed claim can never re-fire the cascade. A real user message resets
+   the depth; synthetic user messages (nudges, system-injected) do not.
 7. **Judge call** — port of `rag_faithfulness_eval/llm_judge.py`:
    `POST {base}/chat/completions`, `temperature 0`, `reasoning: {exclude: true}`,
    `max_tokens 256` (one retry with 512 on parse failure; final parse fallback
@@ -152,6 +158,7 @@ agent reads.
 | `RFE_PREMISE_TOOLS`            | `read\|fetch\|web\|doc\|search`       | regex (case-insensitive) for premise-capture tool names (overrides `RFE_EVIDENCE_SCOPE`) |
 | `RFE_PREMISE_CAP`              | `24000`                              | max chars kept in premise buffer (most recent) |
 | `RFE_MAX_CLAIMS`               | `50`                                 | max claims judged per reply (rest skipped + logged) |
+| `RFE_NUDGE_DEPTH`              | `2`                                  | max nudge-triggered auto-rounds per user turn; nudge-child replies beyond the cap are not judged |
 | `RFE_CACHE_DIR`                | unset (memory-only)                  | persistent verdict cache directory |
 | `RFE_JUDGE_LOG`                | unset (silent)                       | log sink: file path, or `stderr` for debug |
 

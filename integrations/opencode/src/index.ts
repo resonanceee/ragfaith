@@ -178,6 +178,15 @@ export function flagVerdicts(
     : ["unfaithful"];
 }
 
+/** Max nudge-triggered auto-rounds per user turn — bounds the cascade if each
+ *  fix reply keeps producing fresh flagged claims. */
+export function nudgeDepthCap(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const n = Number.parseInt(env["RFE_NUDGE_DEPTH"] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : 2;
+}
+
 // ---------------------------------------------------------------------------
 // per-claim premise selection (issue #82)
 // ---------------------------------------------------------------------------
@@ -209,6 +218,13 @@ function claimTokens(text: string): Set<string> {
     if (t && !STOPWORDS.has(t)) out.add(t);
   }
   return out;
+}
+
+/** Whitespace/punctuation-insensitive claim identity, for nudge dedup: a
+ *  claim already nudged this turn must never re-fire, or unfixed claims
+ *  loop the cascade forever. */
+function claimKey(claim: string): string {
+  return claim.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
 /** Source tag for the evidence a claim most leans on: highest lexical overlap
@@ -811,7 +827,10 @@ interface SessionState {
   activeModel: string;
   parts: Map<string, Map<string, string>>; // messageID -> partID -> text
   judged: Set<string>; // messageIDs already judged
-  nudgeIds: Set<string>; // our own injected message ids (loop guard)
+  nudgeIds: Set<string>; // our own injected nudge message ids
+  syntheticIds: Set<string>; // messages whose parts are synthetic (ours + system-injected)
+  flaggedKeys: Set<string>; // claims nudged during the current user turn (dedup)
+  nudgeDepth: number; // nudge-triggered auto-rounds used in the current user turn
 }
 
 function makeState(): SessionState {
@@ -822,6 +841,9 @@ function makeState(): SessionState {
     parts: new Map(),
     judged: new Set(),
     nudgeIds: new Set(),
+    syntheticIds: new Set(),
+    flaggedKeys: new Set(),
+    nudgeDepth: 0,
   };
 }
 
@@ -850,12 +872,32 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
       );
   };
 
-  /** Judge a completed reply; aggregate flagged claims into ONE nudge. */
-  const judgeReply = (sessionID: string, messageID: string): void => {
+  /** Judge a completed reply; aggregate flagged claims into ONE nudge.
+   *  Replies to our own nudges are judged too (verification round) while
+   *  nudgeDepth < cap; claims nudged earlier this turn are deduped so an
+   *  unfixed claim can't re-fire the cascade. */
+  const judgeReply = (
+    sessionID: string,
+    messageID: string,
+    parentID: string,
+  ): void => {
     void (async () => {
       const st = stateOf(sessionID);
       if (st.judged.has(messageID)) return;
       st.judged.add(messageID);
+      const nudgeChild = st.nudgeIds.has(parentID);
+      if (nudgeChild && st.nudgeDepth >= nudgeDepthCap()) {
+        logLine(
+          {
+            ts: new Date().toISOString(),
+            session: sessionID,
+            kind: "nudge-depth-capped",
+            depth: st.nudgeDepth,
+          },
+          logFile,
+        );
+        return;
+      }
       const text = [...(st.parts.get(messageID)?.values() ?? [])].join("\n");
       const context = st.premises.text;
       if (!text.trim() || !context.trim()) return;
@@ -883,7 +925,9 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         cache: cacheOf(judgeModel),
         logFile: logFile ?? "",
       });
-      const claims = segmentClaims(text);
+      const claims = segmentClaims(text).filter(
+        (c) => !st.flaggedKeys.has(claimKey(c)),
+      );
       const kept = claims.slice(0, maxClaims());
       if (kept.length < claims.length) {
         logLine(
@@ -919,14 +963,17 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
       const nudgeId = `msg_rfe_nudge_${Date.now().toString(36)}`;
       st.nudgeIds.add(nudgeId);
       try {
+        // no noReply: the nudge triggers a turn so the agent reconciles
+        // immediately instead of sitting silent until the user prompts
         await client.session.prompt({
           path: { id: sessionID },
           body: {
             messageID: nudgeId,
-            noReply: true,
             parts: [{ type: "text", text: nudge, synthetic: true }],
           },
         });
+        st.nudgeDepth++;
+        for (const f of flagged) st.flaggedKeys.add(claimKey(f.claim));
       } catch (e) {
         // SDK injection failed: toast + structured log fallback
         logErr("nudge-inject", e, logFile);
@@ -1021,6 +1068,7 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           const part = event.properties.part;
           if (part.type === "text" && part.text) {
             const st = stateOf(part.sessionID);
+            if (part.synthetic) st.syntheticIds.add(part.messageID);
             let msg = st.parts.get(part.messageID);
             if (!msg) {
               msg = new Map();
@@ -1032,15 +1080,24 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
         }
         if (event.type === "message.updated") {
           const info = event.properties.info;
+          if (info.role === "user") {
+            // a real user message starts a fresh turn; synthetic user messages
+            // (our nudges, system-injected) must not reset the cascade counters
+            const st = stateOf(info.sessionID);
+            if (!st.nudgeIds.has(info.id) && !st.syntheticIds.has(info.id)) {
+              st.nudgeDepth = 0;
+              st.flaggedKeys.clear();
+            }
+            return;
+          }
           if (info.role !== "assistant") return;
           const a = info as AssistantMessage;
           if (!a.time.completed || a.error) return;
           const st = stateOf(info.sessionID);
-          if (st.nudgeIds.has(a.parentID)) return; // loop guard
           if (!st.activeModel && a.modelID) {
             st.activeModel = `${a.providerID}/${a.modelID}`;
           }
-          judgeReply(info.sessionID, info.id);
+          judgeReply(info.sessionID, info.id, a.parentID);
           // part text accumulates unboundedly otherwise
           if (st.parts.size > 64) {
             const first = st.parts.keys().next().value;
