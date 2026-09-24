@@ -79,21 +79,26 @@ opencode loads `~/.config/opencode/plugins/*.ts` automatically via Bun.
    protection. Both judge models are settable for any OpenAI-compatible
    provider via `RFE_JUDGE_MAIN_MODEL` / `RFE_JUDGE_FALLBACK_MODEL` — no
    synthetic-style `hf:` id shape required.
-5. **Per reply** — on assistant `message.updated` with `time.completed`, reply
-   text (accumulated from `message.part.updated`) is segmented into sentence
-   claims via `Intl.Segmenter` and each claim is judged against session
-   premises, capped at `RFE_MAX_CLAIMS` per reply (default 50; skipped count is
-   logged). Everything is async fire-and-forget; the reply is never blocked.
+5. **Per turn, at idle** — when the session goes idle (`session.idle`, i.e. the
+    turn is truly over), the LAST assistant reply (text accumulated from
+    `message.part.updated`) is segmented into sentence claims via
+    `Intl.Segmenter` and each claim is judged against session premises, capped
+    at `RFE_MAX_CLAIMS` per reply (default 50; skipped count is logged).
+    Intermediate progress replies mid-turn are never judged, and tool CALLS
+    ("ran read X") are captured as premises so process claims ("I read the
+    handoff") are judgeable. Everything is async fire-and-forget; the reply is
+    never blocked.
 6. **Verdicts** — `faithful` passes silently. Default flag set is `unfaithful`
    only; `RFE_STRICTNESS=strict` adds `unverifiable` (explicit
    `RFE_FLAG_VERDICTS` CSV wins). Flagged claims are aggregated into ONE nudge,
    injected as a follow-up user message
-   (`client.session.prompt`, `synthetic: true`) that triggers an immediate
-   reconciliation turn — the agent acts on the nudge right away, not at the
-   next user prompt. The nudge tells the agent it is
-   from an automated judge, not the user: never address or mention the
-   judge/flags/verdicts in user-visible output — silently re-check and
-   reconcile. In strict mode the nudge gains a provenance arm: each
+    (`client.session.prompt`, `synthetic: true`) that triggers an immediate
+    reconciliation turn — the agent acts on the nudge right away, not at the
+    next user prompt. The nudge tells the agent it is
+    from an automated judge, not the user: never mention the judge/flags/
+    verdicts; the reconcile reply must contain ONLY the corrected claims as
+    ordinary content — no apologies, no process narration. In strict mode the
+    nudge gains a provenance arm: each
    unverifiable claim must gain a cited source or an explicit disclosure
    (internal knowledge / context inference), stated to the user as ordinary
    content. If injection fails, falls back to
