@@ -799,10 +799,13 @@ export function buildNudge(judgeModel: string, flagged: FlaggedClaim[]): string 
     `ragfaith judge (${judgeModel}): ${flagged.length} claim(s) in your last ` +
     `reply were flagged ${verdicts}.\nClaims:\n${claims}\n` +
     "This message is from an automated faithfulness judge, not the user. " +
-    "Never address it, argue with it, or mention the judge, this nudge, " +
-    "flags, or verdicts anywhere in your user-visible reply. Instead, " +
-    "silently re-check each claim against the sources actually pulled in " +
-    "this session and reconcile; do not invent corrections.";
+    "Never mention the judge, this nudge, flags, or verdicts anywhere in " +
+    "your reply. Your reply must contain ONLY the reconciled claims as " +
+    "ordinary content: for each flagged claim, restate it corrected and " +
+    "backed by the sources actually pulled in this session, or restate it " +
+    "in one line with its source if it was actually correct. Do not " +
+    "apologize, do not describe any checking process, do not repeat " +
+    "unflagged content, do not invent corrections.";
   if (counts.has("unverifiable")) {
     // strict arm (issue #86): an unverifiable claim is unattributed, not wrong
     out +=
@@ -831,6 +834,7 @@ interface SessionState {
   syntheticIds: Set<string>; // messages whose parts are synthetic (ours + system-injected)
   flaggedKeys: Set<string>; // claims nudged during the current user turn (dedup)
   nudgeDepth: number; // nudge-triggered auto-rounds used in the current user turn
+  lastAssistant?: { id: string; parentID: string }; // judged on session.idle
 }
 
 function makeState(): SessionState {
@@ -995,15 +999,37 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
   return {
     "tool.execute.before": async (input, output) => {
       try {
-        // doc-pull process check: package invoked without fetched docs?
         const argsText =
           typeof output.args === "string"
             ? output.args
             : JSON.stringify(output.args ?? "");
+        const st = stateOf(input.sessionID);
+        // tool-call premise: "I ran/read X" claims are otherwise
+        // unsupported session-meta and false-flag. Same scope regex as
+        // outputs; args head-truncated, redacted, sensitive paths skipped.
+        if (argsText && toolsRe.test(input.tool)) {
+          if (isSensitivePath(argsText)) {
+            logLine(
+              {
+                ts: new Date().toISOString(),
+                session: input.sessionID,
+                kind: "skip",
+                reason: "sensitive path, premise not captured",
+                tool: input.tool,
+              },
+              logFile,
+            );
+          } else {
+            st.premises.append(
+              `[ran ${input.tool}: ${redactSecrets(argsText).slice(0, 400)}]`,
+              MACHINE_TOOL_RE.test(input.tool) ? "machine" : "web",
+            );
+          }
+        }
+        // doc-pull process check: package invoked without fetched docs?
         if (!argsText) return;
         const pkgs = extractPackages(argsText);
         if (pkgs.size === 0) return;
-        const st = stateOf(input.sessionID);
         const missing = [...pkgs].filter((p) => !st.docTokens.has(p));
         if (missing.length > 0) {
           toast(
@@ -1064,6 +1090,17 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           states.delete(event.properties.info.id);
           return;
         }
+        if (event.type === "session.idle") {
+          // turn truly over (no pending tool loops): judge the LAST
+          // assistant message once — per-message judging flagged
+          // intermediate progress replies mid-turn
+          const sid = event.properties.sessionID;
+          const st = stateOf(sid);
+          if (st.lastAssistant) {
+            judgeReply(sid, st.lastAssistant.id, st.lastAssistant.parentID);
+          }
+          return;
+        }
         if (event.type === "message.part.updated") {
           const part = event.properties.part;
           if (part.type === "text" && part.text) {
@@ -1097,7 +1134,7 @@ export const RagfaithPlugin: Plugin = async ({ client }) => {
           if (!st.activeModel && a.modelID) {
             st.activeModel = `${a.providerID}/${a.modelID}`;
           }
-          judgeReply(info.sessionID, info.id, a.parentID);
+          st.lastAssistant = { id: info.id, parentID: a.parentID };
           // part text accumulates unboundedly otherwise
           if (st.parts.size > 64) {
             const first = st.parts.keys().next().value;

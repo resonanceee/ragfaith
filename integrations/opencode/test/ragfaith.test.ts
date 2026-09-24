@@ -697,8 +697,8 @@ describe("nudge aggregation", () => {
     expect(nudge).toContain("unverifiable (1)");
     expect(nudge).toContain("do not invent corrections");
     expect(nudge).toContain("automated faithfulness judge, not the user");
-    expect(nudge).toContain("or mention the judge, this nudge");
-    expect(nudge).toContain("silently re-check");
+    expect(nudge).toContain("Never mention the judge, this nudge");
+    expect(nudge).toContain("ONLY the reconciled claims");
     expect((nudge.match(/ragfaith judge/g) ?? []).length).toBe(1);
   });
 
@@ -909,6 +909,13 @@ describe("plugin hooks", () => {
         },
       } as unknown as Event,
     });
+    await idle(hooks, sessionID);
+  }
+
+  async function idle(hooks: Hooks, sessionID: string): Promise<void> {
+    await hooks.event!({
+      event: { type: "session.idle", properties: { sessionID } } as unknown as Event,
+    });
   }
 
   async function userMessage(
@@ -1011,6 +1018,7 @@ describe("plugin hooks", () => {
           },
         } as unknown as Event,
       });
+      await idle(hooks, "s2");
       await Bun.sleep(20);
       expect(calls).toBe(0);
       expect(prompts.length).toBe(0);
@@ -1062,6 +1070,7 @@ describe("plugin hooks", () => {
           },
         } as unknown as Event,
       });
+      await idle(hooks, "s4");
       for (let i = 0; i < 100 && !sent; i++) await Bun.sleep(5);
       expect(sent).toContain("A claim.");
       expect(sent).not.toContain("sk-secretsecretsecret");
@@ -1116,6 +1125,7 @@ describe("plugin hooks", () => {
           },
         } as unknown as Event,
       });
+      await idle(hooks, "s3");
       for (let i = 0; i < 100 && prompts.length === 0; i++) await Bun.sleep(5);
       expect(prompts.length).toBe(1);
       const part = prompts[0]!.body.parts[0]!;
@@ -1123,10 +1133,145 @@ describe("plugin hooks", () => {
       // nudge triggers an auto-turn: no noReply
       expect(prompts[0]!.body.noReply).toBeUndefined();
       expect((part.text.match(/\[unfaithful\]/g) ?? []).length).toBe(1);
+      // nudge demands content-only reconcile reply, no judge-speak
+      expect(part.text).toContain("ONLY the reconciled claims");
     } finally {
       globalThis.fetch = origFetch;
       delete process.env["SYNTHETIC_API_KEY"];
       delete process.env["RFE_MAX_CLAIMS"];
+    }
+  });
+
+  test("assistant completion alone does not judge; session.idle does", async () => {
+    const { hooks, prompts } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => okResp("faithful") } as Response;
+    }) as unknown as typeof fetch;
+    try {
+      await capturePremise(hooks, "s-idle");
+      await hooks.event!({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            part: { id: "p1", sessionID: "s-idle", messageID: "m1", type: "text", text: "A claim." },
+          },
+        } as unknown as Event,
+      });
+      await hooks.event!({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "m1",
+              sessionID: "s-idle",
+              role: "assistant",
+              time: { completed: 1 },
+              modelID: "m",
+              providerID: "p",
+              parentID: "u1",
+            },
+          },
+        } as unknown as Event,
+      });
+      await Bun.sleep(50);
+      expect(calls).toBe(0);
+      await idle(hooks, "s-idle");
+      for (let i = 0; i < 100 && calls === 0; i++) await Bun.sleep(5);
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("mid-turn messages judged once at idle -> one nudge for both", async () => {
+    const { hooks, prompts } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    const calls = { n: 0 };
+    globalThis.fetch = unfaithfulFetch(calls);
+    try {
+      await capturePremise(hooks, "s-mid");
+      // two progress replies inside one turn, NO idle yet
+      await hooks.event!({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            part: { id: "p1", sessionID: "s-mid", messageID: "r1", type: "text", text: "Alpha is one." },
+          },
+        } as unknown as Event,
+      });
+      await hooks.event!({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "r1", sessionID: "s-mid", role: "assistant",
+              time: { completed: 1 }, modelID: "m", providerID: "p", parentID: "u1",
+            },
+          },
+        } as unknown as Event,
+      });
+      await hooks.event!({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            part: { id: "p2", sessionID: "s-mid", messageID: "r2", type: "text", text: "Beta is two." },
+          },
+        } as unknown as Event,
+      });
+      await hooks.event!({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: {
+              id: "r2", sessionID: "s-mid", role: "assistant",
+              time: { completed: 1 }, modelID: "m", providerID: "p", parentID: "u1",
+            },
+          },
+        } as unknown as Event,
+      });
+      await Bun.sleep(50);
+      expect(prompts.length).toBe(0);
+      await idle(hooks, "s-mid");
+      await until(() => prompts.length === 1);
+      // only the LAST message judged; one nudge, not one per progress reply
+      expect(calls.n).toBe(1);
+      expect(prompts.length).toBe(1);
+      expect(prompts[0]!.body.parts[0]!.text).toContain("Beta is two.");
+      expect(prompts[0]!.body.parts[0]!.text).not.toContain("Alpha is one.");
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
+    }
+  });
+
+  test("tool-call premise: 'I read X' claims reach the judge as supported", async () => {
+    const { hooks } = await pluginHooks();
+    const origFetch = globalThis.fetch;
+    process.env["SYNTHETIC_API_KEY"] = "test-key";
+    let sent = "";
+    globalThis.fetch = judgeFetch((b) => {
+      sent = b;
+    });
+    try {
+      await hooks["tool.execute.before"]!(
+        { tool: "read", sessionID: "s-call", callID: "c1" },
+        { args: { filePath: "/repo/HANDOFF.md" } },
+      );
+      await reply(hooks, "s-call", "m1", "I read the handoff document.");
+      for (let i = 0; i < 100 && !sent; i++) await Bun.sleep(5);
+      const body = JSON.parse(sent);
+      expect(body.messages[0].content).toBe(MACHINE_SYSTEM_PROMPT);
+      expect(sent).toContain("[ran read:");
+      expect(sent).toContain("HANDOFF.md");
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env["SYNTHETIC_API_KEY"];
     }
   });
 
